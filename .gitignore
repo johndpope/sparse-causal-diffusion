@@ -14,6 +14,8 @@ CLAUDE.md
 README.md.bak
 core*
 stage2*
+output/
+.mcp.json
 
 # Model weights
 *.pth
