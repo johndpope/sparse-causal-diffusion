@@ -63,6 +63,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=288, help="Resize height")
     parser.add_argument("--width", type=int, default=512, help="Resize width")
 
+    # HRR editing options
+    parser.add_argument("--edit_prompt", type=str, default=None, help="Edit prompt (uses HRR to blend with source)")
+    parser.add_argument("--hrr_checkpoint", type=str, default=None, help="HRR enhancer checkpoint path")
+    parser.add_argument(
+        "--hrr_mode", type=str, default="direct",
+        choices=["hybrid", "interpolated", "direct"],
+        help="HRR editing mode: hybrid (channel-swap), interpolated (freq-blend), direct (enhance only)"
+    )
+    parser.add_argument("--hrr_alpha", type=float, default=0.5, help="Blend weight for interpolated mode")
+    parser.add_argument(
+        "--hrr_freq_profile", type=str, default=None,
+        choices=["structure_preserving", "texture_swap"],
+        help="Frequency profile for interpolated mode"
+    )
+
     return parser.parse_args()
 
 
@@ -220,7 +235,7 @@ def main():
         global_embedder.load_state_dict(ge_dict, strict=False)
         print(f"  Loaded GlobalContextEmbedder: {len(ge_dict)} tensors")
 
-    # Load text encoder and encode prompt
+    # Load text encoder and encode prompt(s)
     print("Encoding text prompt...")
     text_encoder = load_text_encoder(
         checkpoint_path=args.model_path,
@@ -232,9 +247,39 @@ def main():
     with torch.inference_mode():
         text_context, _, attention_mask = text_encoder(args.prompt)
 
+        # Encode edit prompt if provided
+        edit_text_context = None
+        edit_text_mask = None
+        if args.edit_prompt:
+            edit_text_context, _, edit_text_mask = text_encoder(args.edit_prompt)
+            print(f"  Edit prompt encoded: '{args.edit_prompt}'")
+
     # Free text encoder
     del text_encoder
     torch.cuda.empty_cache()
+
+    # Load HRR enhancer if checkpoint provided
+    hrr_enhancer = None
+    if args.hrr_checkpoint:
+        print(f"Loading HRR enhancer from {args.hrr_checkpoint}...")
+        from safetensors.torch import load_file as safe_load
+        hrr_state = safe_load(args.hrr_checkpoint)
+
+        # Extract HRR weights from checkpoint
+        hrr_prefix = "strategy.hrr_enhancer."
+        hrr_dict = {
+            k[len(hrr_prefix):]: v for k, v in hrr_state.items()
+            if k.startswith(hrr_prefix)
+        }
+
+        if hrr_dict:
+            from ltx_trainer.hrr_text_enhancer import TokenAwareHRR
+            hrr_enhancer = TokenAwareHRR(dim=3840, num_channels=16)
+            hrr_enhancer.load_state_dict(hrr_dict, strict=False)
+            hrr_enhancer = hrr_enhancer.to(device=args.device, dtype=torch.bfloat16)
+            print(f"  Loaded HRR enhancer: {len(hrr_dict)} tensors")
+        else:
+            print("  Warning: No HRR weights found in checkpoint")
 
     # Move VAE components
     vae_encoder = components.video_vae_encoder.to(device=args.device, dtype=torch.bfloat16)
@@ -252,15 +297,22 @@ def main():
         vae_decoder=vae_decoder,
         scheduler=components.scheduler,
         patchifier=VideoLatentPatchifier(patch_size=1),
+        hrr_enhancer=hrr_enhancer,
     )
 
     # Run inference
-    print(f"Running EditCtrl inference ({args.steps} steps)...")
+    mode_str = f", HRR mode={args.hrr_mode}" if hrr_enhancer else ""
+    print(f"Running EditCtrl inference ({args.steps} steps{mode_str})...")
     output = pipeline(
         source_video=source_video,
         edit_masks=edit_mask,
         text_context=text_context,
         text_mask=attention_mask,
+        edit_text_context=edit_text_context,
+        edit_text_mask=edit_text_mask,
+        hrr_edit_mode=args.hrr_mode,
+        hrr_alpha=args.hrr_alpha,
+        hrr_freq_profile=args.hrr_freq_profile,
         num_inference_steps=args.steps,
         guidance_scale=args.guidance_scale,
         seed=args.seed,

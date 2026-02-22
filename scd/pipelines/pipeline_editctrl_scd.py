@@ -54,6 +54,7 @@ class EditCtrlSCDPipeline:
         scheduler: Noise scheduler (flow matching)
         patchifier: Video latent patchifier
         text_encoder: Text encoder (or cached embeddings)
+        hrr_enhancer: Optional HRR text enhancer for editing modes
     """
 
     def __init__(
@@ -66,6 +67,7 @@ class EditCtrlSCDPipeline:
         scheduler: object,
         patchifier: object,
         text_encoder: nn.Module | None = None,
+        hrr_enhancer: nn.Module | None = None,
     ):
         self.scd_model = scd_model
         self.local_context_module = local_context_module
@@ -75,6 +77,7 @@ class EditCtrlSCDPipeline:
         self.scheduler = scheduler
         self.patchifier = patchifier
         self.text_encoder = text_encoder
+        self.hrr_enhancer = hrr_enhancer
 
     @torch.inference_mode()
     def __call__(
@@ -83,6 +86,11 @@ class EditCtrlSCDPipeline:
         edit_masks: Tensor,
         text_context: Tensor,
         text_mask: Tensor,
+        edit_text_context: Tensor | None = None,
+        edit_text_mask: Tensor | None = None,
+        hrr_edit_mode: str = "direct",
+        hrr_alpha: float = 0.5,
+        hrr_freq_profile: str | None = None,
         num_inference_steps: int = 20,
         guidance_scale: float = 4.0,
         seed: int = 42,
@@ -94,8 +102,17 @@ class EditCtrlSCDPipeline:
         Args:
             source_video: Source video tensor [B, C, F, H, W] in pixel space [-1, 1]
             edit_masks: Binary pixel masks [B, 1, F, H, W] (1 = edit region)
-            text_context: Pre-computed text embeddings [B, ctx_len, D]
+            text_context: Pre-computed text embeddings [B, ctx_len, D] (source prompt)
             text_mask: Text attention mask [B, ctx_len]
+            edit_text_context: Optional edit prompt embeddings [B, ctx_len, D]
+            edit_text_mask: Optional edit prompt attention mask [B, ctx_len]
+            hrr_edit_mode: HRR editing mode when edit_text_context is provided:
+                "hybrid" — channel-selective swap via routing divergence
+                "interpolated" — frequency-domain blending
+                "direct" — just enhance edit prompt with HRR
+            hrr_alpha: Blend weight for interpolated mode (0=source, 1=target)
+            hrr_freq_profile: Frequency profile for interpolated mode
+                ("structure_preserving" or "texture_swap")
             num_inference_steps: Number of denoising steps per frame
             guidance_scale: CFG guidance scale
             seed: Random seed
@@ -106,6 +123,47 @@ class EditCtrlSCDPipeline:
             EditCtrlSCDOutput with edited video
         """
         generator = torch.Generator(device=device).manual_seed(seed)
+
+        # 0. HRR text enhancement (if available)
+        if self.hrr_enhancer is not None:
+            src_ctx = text_context.to(device=device, dtype=dtype)
+
+            if edit_text_context is not None:
+                edit_ctx = edit_text_context.to(device=device, dtype=dtype)
+
+                if hrr_edit_mode == "hybrid" and hasattr(self.hrr_enhancer, "forward_hybrid"):
+                    # Auto-detect which channels to swap via routing divergence
+                    from ltx_trainer.hrr_text_enhancer import TokenAwareHRR
+                    if isinstance(self.hrr_enhancer, TokenAwareHRR):
+                        channel_div = TokenAwareHRR.compute_channel_divergence(
+                            src_ctx, edit_ctx, self.hrr_enhancer.router
+                        )
+                        # Threshold: swap channels with divergence > median
+                        threshold = channel_div.median()
+                        channel_mask = (channel_div > threshold).float()
+                    else:
+                        # Fallback: equal blend
+                        n_ch = getattr(self.hrr_enhancer, "num_channels", 16)
+                        channel_mask = torch.ones(n_ch, device=device) * 0.5
+
+                    text_context = self.hrr_enhancer.forward_hybrid(src_ctx, edit_ctx, channel_mask)
+                    if edit_text_mask is not None:
+                        text_mask = edit_text_mask
+
+                elif hrr_edit_mode == "interpolated" and hasattr(self.hrr_enhancer, "forward_interpolated"):
+                    text_context = self.hrr_enhancer.forward_interpolated(
+                        src_ctx, edit_ctx, alpha=hrr_alpha, freq_profile=hrr_freq_profile
+                    )
+                    if edit_text_mask is not None:
+                        text_mask = edit_text_mask
+
+                else:  # "direct" mode
+                    text_context = self.hrr_enhancer(edit_ctx)
+                    if edit_text_mask is not None:
+                        text_mask = edit_text_mask
+            else:
+                # No edit prompt — just enhance source prompt
+                text_context = self.hrr_enhancer(src_ctx)
 
         # 1. VAE encode source video → latents
         source_latents = self.vae_encoder(
