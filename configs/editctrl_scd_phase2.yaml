@@ -1,24 +1,25 @@
-# SCD Fine-tuning Config — Isometric I2V Dataset (128 samples)
+# EditCtrl + SCD Phase 2: Local + Global Context
 #
-# This fine-tunes the original LTX-2 19B model with SCD (Separable Causal Diffusion):
-#   - Encoder (layers 0-31): causal mask, timestep=0, runs once per frame
-#   - Decoder (layers 32-47): token_concat coupling, actual sigma, runs N times
+# Adds GlobalContextEmbedder on top of Phase 1 checkpoint.
+# Global context injects downsampled background information through cross-attention,
+# helping the model maintain visual coherence between edited and unedited regions.
 #
-# The model shares ALL weights with the original checkpoint. Fine-tuning teaches it
-# to produce good features under the causal mask constraint.
+# Prerequisites:
+#   - Phase 1 EditCtrl checkpoint (from editctrl_scd_phase1.yaml)
 #
 # Usage:
 #   cd /home/johndpope/Documents/GitHub/ltx2-omnitransfer/packages/ltx-trainer
-#   python -m ltx_trainer.train --config /home/johndpope/Documents/GitHub/sparse-causal-diffusion/configs/scd_finetune.yaml
+#   python -m ltx_trainer.train --config /home/johndpope/Documents/GitHub/sparse-causal-diffusion/configs/editctrl_scd_phase2.yaml
 
 seed: 42
-output_dir: /home/johndpope/Documents/GitHub/sparse-causal-diffusion/outputs/scd_finetune_v1
+output_dir: /home/johndpope/Documents/GitHub/sparse-causal-diffusion/outputs/editctrl_scd_phase2
 
 model:
   model_path: /media/2TB/ltx-models/ltx2/ltx-2-19b-dev.safetensors
   text_encoder_path: /media/2TB/ltx-models/gemma
   training_mode: lora
-  load_checkpoint: null
+  # Load Phase 1 EditCtrl checkpoint
+  load_checkpoint: /home/johndpope/Documents/GitHub/sparse-causal-diffusion/outputs/editctrl_scd_phase1/checkpoints
 
 acceleration:
   mixed_precision_mode: bf16
@@ -41,8 +42,8 @@ data:
   num_dataloader_workers: 2
 
 lora:
-  rank: 32
-  alpha: 32
+  rank: 64
+  alpha: 64
   dropout: 0.0
   target_modules:
     - to_k
@@ -53,7 +54,7 @@ lora:
 optimization:
   batch_size: 1
   gradient_accumulation_steps: 4
-  learning_rate: 0.0001
+  learning_rate: 0.000005  # Even lower LR for phase 2 (5e-6)
   max_grad_norm: 1.0
   optimizer_type: adamw
   weight_decay: 0.0001
@@ -67,15 +68,24 @@ flow_matching:
   timestep_sampling_params: {}
 
 training_strategy:
-  name: scd
+  name: editctrl_scd
   encoder_layers: 32
   decoder_input_combine: token_concat
   clean_context_ratio: 0.0
   decoder_multi_batch: 1
-  first_frame_conditioning_p: 0.1
+  first_frame_conditioning_p: 0.0
   with_audio: false
   log_reconstructions: true
-  reconstruction_log_interval: 50
+  reconstruction_log_interval: 100
+  # EditCtrl params — Phase 2
+  editctrl_phase: 2             # Phase 2: local + global context
+  local_num_blocks: 4
+  mask_dilation_latent: 2
+  global_context_num_tokens: 256
+  mask_min_area: 0.05
+  mask_max_area: 0.6
+  freeze_base_lora: true
+  gradient_checkpointing_local: true
 
 checkpoints:
   interval: 500
@@ -84,14 +94,14 @@ checkpoints:
 
 wandb:
   enabled: true
-  project: scd-finetune
+  project: editctrl-scd
   entity: null
   log_validation_videos: false
   tags:
+    - editctrl
     - scd
-    - isometric
-    - finetune
-    - v1
+    - phase2
+    - global-context
 
 validation:
   interval: null
@@ -100,7 +110,7 @@ validation:
   seed: 42
   inference_steps: 20
   guidance_scale: 4.0
-  negative_prompt: "worst quality, blurry, distorted"
+  negative_prompt: "worst quality, blurry, distorted, artifacts"
   frame_rate: 25.0
   video_dims: [512, 288, 33]
   videos_per_prompt: 1
