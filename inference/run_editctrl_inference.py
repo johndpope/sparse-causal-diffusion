@@ -63,6 +63,52 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=288, help="Resize height")
     parser.add_argument("--width", type=int, default=512, help="Resize width")
 
+    # Boundary blending args (LayerFusion)
+    parser.add_argument(
+        "--boundary_blend", type=str, default="hard",
+        choices=["hard", "distance", "attention", "hybrid"],
+        help="Boundary blending mode: hard (binary, default), distance (signed-distance "
+             "soft blend), attention (attention-derived, Phase 2), hybrid (distance+attention)"
+    )
+    parser.add_argument(
+        "--boundary_falloff", type=int, default=3,
+        help="Boundary falloff in tokens (higher = softer transition, default 3)"
+    )
+    parser.add_argument(
+        "--boundary_sharpness", type=float, default=10.0,
+        help="Sigmoid sharpness for boundary blend (default 10.0)"
+    )
+    parser.add_argument(
+        "--boundary_step_threshold", type=float, default=0.5,
+        help="Fraction of denoising steps before soft blending kicks in (default 0.5)"
+    )
+
+    # TMA args
+    parser.add_argument(
+        "--tma_checkpoint", type=str, default=None,
+        help="Path to checkpoint containing TMA weights (strategy.tma.* keys)"
+    )
+    parser.add_argument(
+        "--qwen_model_path", type=str, default="Qwen/Qwen2.5-VL-7B-Instruct",
+        help="Qwen VL model for live feature extraction at inference"
+    )
+    parser.add_argument(
+        "--qwen_device", type=str, default="cuda:1",
+        help="Device for Qwen VL model"
+    )
+    parser.add_argument(
+        "--tma_mllm_hidden_dim", type=int, default=3584,
+        help="Qwen VL hidden dimension (7B=3584)"
+    )
+    parser.add_argument(
+        "--tma_output_dim", type=int, default=3840,
+        help="TMA output dim (must match Gemma embedding dim)"
+    )
+    parser.add_argument(
+        "--tma_num_queries", type=int, default=8,
+        help="Number of TMA MetaQuery tokens"
+    )
+
     return parser.parse_args()
 
 
@@ -120,6 +166,81 @@ def load_mask(path: str, num_frames: int, height: int, width: int) -> torch.Tens
         mask = (mask_vid > 0.5).float().unsqueeze(0)  # [1, 1, F, H, W]
 
     return mask
+
+
+@torch.inference_mode()
+def _extract_qwen_features_live(
+    source_video: torch.Tensor,
+    prompt: str,
+    qwen_model_path: str,
+    device: str = "cuda:1",
+) -> torch.Tensor:
+    """Extract Qwen VL features from source video frames at inference time.
+
+    Args:
+        source_video: [1, C, F, H, W] in [-1, 1]
+        prompt: Text prompt for the editing task
+        qwen_model_path: Qwen VL model name or path
+        device: Device for Qwen VL
+
+    Returns:
+        features: [1, seq_len, hidden_dim] Qwen hidden states
+    """
+    from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, BitsAndBytesConfig
+    from PIL import Image
+    import numpy as np
+
+    # Load Qwen VL in 8-bit
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        qwen_model_path,
+        torch_dtype=torch.bfloat16,
+        quantization_config=BitsAndBytesConfig(load_in_8bit=True),
+        device_map="auto",
+    )
+    model.eval()
+    processor = AutoProcessor.from_pretrained(qwen_model_path)
+    hidden_dim = model.config.hidden_size
+
+    # Convert video tensor to PIL images (sample 4 frames evenly)
+    video = source_video[0]  # [C, F, H, W]
+    F_total = video.shape[1]
+    frame_indices = [int(i * (F_total - 1) / 3) for i in range(4)]
+
+    images = []
+    for fi in frame_indices:
+        frame = video[:, fi]  # [C, H, W]
+        frame = ((frame.float().clamp(-1, 1) + 1) / 2 * 255).byte()
+        frame_np = frame.permute(1, 2, 0).cpu().numpy()
+        images.append(Image.fromarray(frame_np))
+
+    # Build Qwen conversation
+    content = []
+    for img in images:
+        content.append({"type": "image", "image": img})
+    content.append({
+        "type": "text",
+        "text": (
+            "You are analyzing a video clip for a video editing task. "
+            "Describe the visual content, scene layout, objects, style, and any motion visible. "
+            f"\n\nCaption: {prompt}"
+        ),
+    })
+    messages = [{"role": "user", "content": content}]
+
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = processor(text=[text], images=images, padding=True, return_tensors="pt")
+
+    model_device = next(model.parameters()).device
+    inputs = {k: v.to(model_device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+
+    outputs = model(**inputs, output_hidden_states=True, return_dict=True)
+    features = outputs.hidden_states[-1][0].float().cpu()  # [seq_len, hidden_dim]
+
+    # Clean up Qwen model
+    del model, processor
+    torch.cuda.empty_cache()
+
+    return features.unsqueeze(0)  # [1, seq_len, hidden_dim]
 
 
 def main():
@@ -220,6 +341,40 @@ def main():
         global_embedder.load_state_dict(ge_dict, strict=False)
         print(f"  Loaded GlobalContextEmbedder: {len(ge_dict)} tensors")
 
+    # Load TMA module if checkpoint provided
+    tma_module = None
+    qwen_features = None
+    if args.tma_checkpoint:
+        print("Loading TMA module...")
+        from ltx_trainer.omnitransfer.components import TaskAdaptiveMultimodalAlignment
+
+        tma_module = TaskAdaptiveMultimodalAlignment(
+            mllm_hidden_dim=args.tma_mllm_hidden_dim,
+            output_dim=args.tma_output_dim,
+            num_connector_layers=3,
+            num_queries_per_task=args.tma_num_queries,
+        ).to(device=args.device, dtype=torch.bfloat16)
+
+        # Load TMA weights from checkpoint
+        tma_ckpt = load_file(args.tma_checkpoint)
+        tma_dict = {
+            k.replace("strategy.tma.", ""): v
+            for k, v in tma_ckpt.items()
+            if k.startswith("strategy.tma.")
+        }
+        if tma_dict:
+            tma_module.load_state_dict(tma_dict, strict=False)
+            print(f"  Loaded TMA: {len(tma_dict)} tensors")
+        else:
+            print("  WARNING: No strategy.tma.* keys found in checkpoint")
+
+        # Extract Qwen VL features from source video
+        print(f"Extracting Qwen VL features using {args.qwen_model_path}...")
+        qwen_features = _extract_qwen_features_live(
+            source_video, args.prompt, args.qwen_model_path, args.qwen_device
+        )
+        print(f"  Qwen features shape: {qwen_features.shape}")
+
     # Load text encoder and encode prompt
     print("Encoding text prompt...")
     text_encoder = load_text_encoder(
@@ -252,10 +407,12 @@ def main():
         vae_decoder=vae_decoder,
         scheduler=components.scheduler,
         patchifier=VideoLatentPatchifier(patch_size=1),
+        tma_module=tma_module,
     )
 
     # Run inference
-    print(f"Running EditCtrl inference ({args.steps} steps)...")
+    blend_desc = f", blend={args.boundary_blend}" if args.boundary_blend != "hard" else ""
+    print(f"Running EditCtrl inference ({args.steps} steps{blend_desc})...")
     output = pipeline(
         source_video=source_video,
         edit_masks=edit_mask,
@@ -265,6 +422,11 @@ def main():
         guidance_scale=args.guidance_scale,
         seed=args.seed,
         device=args.device,
+        qwen_features=qwen_features,
+        boundary_blend_mode=args.boundary_blend,
+        boundary_falloff=args.boundary_falloff,
+        boundary_sharpness=args.boundary_sharpness,
+        boundary_step_threshold=args.boundary_step_threshold,
     )
 
     # Save output video

@@ -1,0 +1,155 @@
+# EditCtrl + SCD + TMA: Phase 1 with Qwen VL Semantic Guidance
+#
+# Extends Phase 1 EditCtrl training with TMA (Task-adaptive Multimodal Alignment).
+# TMA prepends 8 learned semantic tokens from Qwen VL features to the text context,
+# giving the model visual-semantic understanding beyond what Gemma text embeddings provide.
+#
+# New trainable params: ~39M (TMA connector MLP) + LocalContextModule + EditCtrl LoRA
+# VRAM impact: ~78 MB extra (negligible on RTX 5090)
+#
+# Prerequisites:
+#   1. Trained SCD LoRA checkpoint (from scd_finetune.yaml)
+#   2. Pre-encoded latents and cached embeddings
+#   3. Pre-computed Qwen VL features:
+#      python scripts/compute_qwen_features.py \
+#        --frames_dir /media/12TB/isometric_3d/r2_native_dataset/new_grok_frames \
+#        --metadata /media/2TB/isometric_i2v_training/metadata.json \
+#        --output_dir /media/2TB/isometric_i2v_training/qwen_vl_features \
+#        --device cuda:1
+#
+# Usage:
+#   cd /home/johndpope/Documents/GitHub/ltx2-omnitransfer/packages/ltx-trainer
+#   python -m ltx_trainer.train --config /home/johndpope/Documents/GitHub/sparse-causal-diffusion/configs/editctrl_scd_tma.yaml
+
+seed: 42
+output_dir: /home/johndpope/Documents/GitHub/sparse-causal-diffusion/outputs/editctrl_scd_tma
+
+model:
+  model_path: /media/2TB/ltx-models/ltx2/ltx-2-19b-dev.safetensors
+  text_encoder_path: /media/2TB/ltx-models/gemma
+  training_mode: lora
+  # Load the SCD LoRA checkpoint as base (will be frozen)
+  load_checkpoint: /home/johndpope/Documents/GitHub/sparse-causal-diffusion/outputs/scd_finetune_v1/checkpoints
+
+acceleration:
+  mixed_precision_mode: bf16
+  quantization: int8-quanto
+  load_text_encoder_in_8bit: false
+
+hardware:
+  devices:
+    transformer: cuda:0
+    vae_encoder: cuda:0
+    vae_decoder: cuda:1
+    text_encoder: cuda:0
+    audio_vae: cuda:0
+    vocoder: cuda:0
+
+data:
+  preprocessed_data_root: /media/2TB/isometric_i2v_training
+  use_cached_final_embeddings: true
+  final_embeddings_dir: conditions_final
+  num_dataloader_workers: 2
+
+lora:
+  rank: 32           # Must match SCD base checkpoint rank for loading
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - to_k
+    - to_q
+    - to_v
+    - to_out.0
+
+optimization:
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  learning_rate: 0.00001  # 1e-5, same as Phase 1
+  max_grad_norm: 1.0
+  optimizer_type: adamw8bit
+  weight_decay: 0.0001
+  scheduler_type: cosine
+  scheduler_params: {}
+  steps: 3000
+  enable_gradient_checkpointing: true
+
+flow_matching:
+  timestep_sampling_mode: shifted_logit_normal
+  timestep_sampling_params: {}
+
+training_strategy:
+  name: editctrl_scd
+  # SCD base params (inherited)
+  encoder_layers: 32
+  decoder_input_combine: token_concat
+  clean_context_ratio: 0.0
+  decoder_multi_batch: 1
+  first_frame_conditioning_p: 0.0  # No first-frame conditioning for editing
+  with_audio: false
+  log_reconstructions: true
+  reconstruction_log_interval: 100
+  # EditCtrl params
+  editctrl_phase: 1             # Phase 1: local context only
+  local_num_blocks: 2           # 2 lightweight transformer blocks
+  local_inner_dim: 512          # Compact LCM — projects to 4096 output via gate_proj
+  local_heads: 8                # 8 attention heads for 512-dim (8*64=512)
+  local_dim_head: 64            # 64 dim per head (matches common transformer practice)
+  mask_dilation_latent: 2       # Dilate mask by 2 latent tokens
+  global_context_num_tokens: 256
+  mask_min_area: 0.05           # 5% minimum mask area
+  mask_max_area: 0.6            # 60% maximum mask area
+  freeze_base_lora: true        # Keep SCD LoRA frozen
+  gradient_checkpointing_local: true
+  # Paper alignment params
+  background_fill_value: 0.5    # Fill masked region with 0.5 (paper: mid-gray neutral)
+  mask_channel_concat: true     # Concatenate edit mask as channel to LCM input (paper: C=[E(V_b),V_m↓])
+  local_control_injection: per_layer  # Inject at selected decoder layers (paper: FFN output injection)
+  local_control_layers: [0, 2, 4, 6, 8, 10, 12, 14]  # Every other decoder block (16 total)
+  # TMA params — Qwen VL semantic guidance
+  use_tma: true
+  tma_mllm_hidden_dim: 3584    # Qwen2.5-VL-7B hidden size
+  tma_output_dim: 3840          # Must match Gemma embedding dim
+  tma_num_queries: 8            # 8 MetaQuery tokens per task
+  tma_connector_layers: 3       # 3-layer MLP connector
+  tma_features_dir: qwen_vl_features  # Subdirectory in preprocessed_data_root
+  # Mask generation settings (MuLAn dataset integration)
+  mask_source: random                  # random | semantic | mixed
+  semantic_mask_dir: null              # Path to pre-extracted MuLAn mask library (e.g., /media/2TB/mulan_masks)
+  semantic_mask_ratio: 0.5             # Fraction of samples using semantic masks in "mixed" mode
+
+checkpoints:
+  interval: 500
+  keep_last_n: 3
+  precision: bfloat16
+
+wandb:
+  enabled: true
+  project: editctrl-scd
+  entity: null
+  log_validation_videos: false
+  tags:
+    - editctrl
+    - scd
+    - tma
+    - qwen-vl
+    - phase1
+
+validation:
+  interval: null
+  skip_initial_validation: true
+  prompts: []
+  seed: 42
+  inference_steps: 20
+  guidance_scale: 4.0
+  negative_prompt: "worst quality, blurry, distorted, artifacts"
+  frame_rate: 25.0
+  video_dims: [512, 288, 33]
+  videos_per_prompt: 1
+  images: null
+  reference_videos: null
+  generate_audio: false
+  include_reference_in_output: false
+  stg_mode: stg_v
+  stg_scale: 1.0
+  stg_blocks:
+    - 29
