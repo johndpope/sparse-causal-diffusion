@@ -191,15 +191,72 @@ def parse_objects(response: str, img_w: int, img_h: int) -> list[dict]:
     return objects
 
 
-def objects_to_masks(
+def load_sam(checkpoint: str, device: str = "cuda:0"):
+    """Load SAM model for segmentation."""
+    from segment_anything import sam_model_registry, SamPredictor
+
+    print(f"Loading SAM ViT-H from {checkpoint} on {device}...")
+    sam = sam_model_registry["vit_h"](checkpoint=checkpoint)
+    sam = sam.to(device)
+    sam.eval()
+    predictor = SamPredictor(sam)
+    return predictor
+
+
+def objects_to_masks_sam(
+    objects: list[dict],
+    image: "Image.Image",
+    sam_predictor,
+    latent_h: int = 36,
+    latent_w: int = 24,
+) -> torch.Tensor:
+    """Use SAM to generate pixel-accurate segmentation masks from bounding boxes.
+
+    Pipeline: Qwen VL bbox → SAM prompt → pixel mask → downsample to latent grid.
+
+    Returns: [N_objects, latent_h, latent_w] binary float tensor
+    """
+    if len(objects) == 0:
+        return torch.zeros(0, latent_h, latent_w)
+
+    # Set image for SAM
+    img_np = np.array(image)
+    sam_predictor.set_image(img_np)
+
+    masks = torch.zeros(len(objects), latent_h, latent_w)
+
+    for i, obj in enumerate(objects):
+        x1, y1, x2, y2 = obj["bbox_pixel"]
+        input_box = np.array([x1, y1, x2, y2])
+
+        # SAM prediction with bbox prompt
+        sam_masks, scores, _ = sam_predictor.predict(
+            box=input_box,
+            multimask_output=True,
+        )
+        # Pick highest-scoring mask
+        best_idx = scores.argmax()
+        pixel_mask = sam_masks[best_idx]  # [H, W] bool
+
+        # Store full-res mask for visualization
+        obj["pixel_mask"] = pixel_mask
+
+        # Downsample to latent resolution using max-pool approach
+        mask_tensor = torch.from_numpy(pixel_mask.astype(np.float32)).unsqueeze(0).unsqueeze(0)
+        mask_latent = torch.nn.functional.adaptive_max_pool2d(
+            mask_tensor, output_size=(latent_h, latent_w)
+        ).squeeze()
+        masks[i] = mask_latent
+
+    return masks
+
+
+def objects_to_masks_bbox(
     objects: list[dict],
     latent_h: int = 36,
     latent_w: int = 24,
 ) -> torch.Tensor:
-    """Convert bounding boxes to binary masks at latent spatial resolution.
-
-    LTX-2 latent shape for 768×1152 input: [C, F, 36, 24] where
-    H_latent=36 corresponds to pixel H=1152 and W_latent=24 corresponds to pixel W=768.
+    """Fallback: Convert bounding boxes to rectangular masks at latent resolution.
 
     Returns: [N_objects, latent_h, latent_w] binary float tensor
     """
@@ -207,13 +264,10 @@ def objects_to_masks(
 
     for i, obj in enumerate(objects):
         x1_n, y1_n, x2_n, y2_n = obj["bbox_norm"]
-        # Map normalized coords to latent grid
-        # Note: latent_h corresponds to image height, latent_w to image width
         lx1 = int(x1_n * latent_w)
         ly1 = int(y1_n * latent_h)
         lx2 = max(lx1 + 1, int(x2_n * latent_w + 0.5))
         ly2 = max(ly1 + 1, int(y2_n * latent_h + 0.5))
-        # Clamp
         lx1 = max(0, min(lx1, latent_w - 1))
         ly1 = max(0, min(ly1, latent_h - 1))
         lx2 = max(1, min(lx2, latent_w))
@@ -228,32 +282,63 @@ def visualize_detections(
     objects: list[dict],
     save_path: str,
 ):
-    """Draw detected bounding boxes on the image for visual inspection."""
+    """Draw detected segmentation masks (or bboxes) on the image."""
     img = Image.open(image_path).copy()
+    img_np = np.array(img).astype(np.float32)
     draw = ImageDraw.Draw(img)
-    colors = ["red", "lime", "blue", "yellow", "cyan", "magenta", "orange", "purple",
-              "pink", "turquoise", "gold", "white", "coral", "khaki", "violet", "tomato"]
+    colors_rgb = [
+        (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
+        (0, 255, 255), (255, 0, 255), (255, 128, 0), (128, 0, 255),
+        (255, 128, 128), (0, 200, 200), (255, 215, 0), (255, 255, 255),
+    ]
+    color_names = ["red", "lime", "blue", "yellow", "cyan", "magenta", "orange", "purple",
+                   "pink", "turquoise", "gold", "white"]
 
+    # Overlay SAM masks with semi-transparent color
+    overlay = img_np.copy()
     for i, obj in enumerate(objects):
-        color = colors[i % len(colors)]
+        color = colors_rgb[i % len(colors_rgb)]
+        pixel_mask = obj.get("pixel_mask", None)
+        if pixel_mask is not None:
+            # SAM silhouette overlay
+            for c in range(3):
+                overlay[:, :, c] = np.where(
+                    pixel_mask,
+                    overlay[:, :, c] * 0.5 + color[c] * 0.5,
+                    overlay[:, :, c],
+                )
+        else:
+            # Fallback: bbox rectangle
+            x1, y1, x2, y2 = obj["bbox_pixel"]
+            draw.rectangle([x1, y1, x2, y2], outline=color_names[i % len(color_names)], width=3)
+
+    # Convert back to PIL and draw labels
+    result = Image.fromarray(overlay.astype(np.uint8))
+    draw = ImageDraw.Draw(result)
+    for i, obj in enumerate(objects):
+        color_name = color_names[i % len(color_names)]
         x1, y1, x2, y2 = obj["bbox_pixel"]
-        draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
-        # Draw name label
         label = obj["name"]
-        draw.rectangle([x1, max(0, y1 - 16), x1 + len(label) * 7, y1], fill=color)
+        draw.rectangle([x1, max(0, y1 - 16), x1 + len(label) * 7, y1], fill=color_name)
         draw.text((x1 + 2, max(0, y1 - 15)), label, fill="black")
 
-    img.save(save_path)
+    result.save(save_path)
     return save_path
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compute semantic masks using Qwen VL grounding")
+    parser = argparse.ArgumentParser(description="Compute semantic masks using Qwen VL + SAM")
     parser.add_argument("--device", default="cuda:1", help="GPU device for Qwen VL")
+    parser.add_argument("--sam-device", default=None, help="GPU for SAM (default: same as --device)")
+    parser.add_argument("--sam-checkpoint", default="/media/12TB/grounded-segment-any-parts/sam_vit_h_4b8939.pth",
+                        help="SAM ViT-H checkpoint path")
+    parser.add_argument("--no-sam", action="store_true", help="Skip SAM, use bbox rectangles only")
     parser.add_argument("--viz", action="store_true", help="Save visualization images")
     parser.add_argument("--data-root", default="/media/2TB/isometric_i2v_training")
     parser.add_argument("--frames-root", default="/media/12TB/isometric_3d/r2_native_dataset/new_grok_frames")
     parser.add_argument("--output-dir", default=None, help="Override output directory")
+    parser.add_argument("--skip-qwen", action="store_true",
+                        help="Reuse existing Qwen VL detections, only re-run SAM segmentation")
     args = parser.parse_args()
 
     # Load metadata
@@ -281,8 +366,18 @@ def main():
         viz_dir = os.path.join(mask_dir, "visualizations")
         os.makedirs(viz_dir, exist_ok=True)
 
-    # Load Qwen VL
-    model, processor = load_qwen(args.device)
+    # Load models
+    sam_predictor = None
+    if not args.no_sam:
+        sam_device = args.sam_device or args.device
+        sam_predictor = load_sam(args.sam_checkpoint, sam_device)
+
+    qwen_model, qwen_processor = None, None
+    if not args.skip_qwen:
+        qwen_model, qwen_processor = load_qwen(args.device)
+
+    # Cache file for Qwen VL detections (avoid re-running expensive VLM)
+    cache_path = os.path.join(mask_dir, "_qwen_detections_cache.pt")
 
     # Process each unique scene
     all_results = {}
@@ -292,7 +387,6 @@ def main():
         print(f"  {len(group)} clips from this scene")
 
         # Use the first frame of the first clip as representative
-        # (isometric scenes are mostly static — same objects across all clips)
         first_pair = group[0]
         start_frame = first_pair["start_frame"]
         frame_path = os.path.join(
@@ -301,7 +395,6 @@ def main():
         )
 
         if not os.path.exists(frame_path):
-            # Try alternate frame numbering
             frame_path = os.path.join(args.frames_root, f"{video_id}_012.jpg")
             if not os.path.exists(frame_path):
                 print(f"  WARNING: No frame found for {video_id}, skipping")
@@ -310,22 +403,36 @@ def main():
         img = Image.open(frame_path)
         print(f"  Frame: {os.path.basename(frame_path)} ({img.size[0]}x{img.size[1]})")
 
-        # Run grounding
-        response = detect_objects(model, processor, frame_path)
-        objects = parse_objects(response, img.width, img.height)
-        print(f"  Detected {len(objects)} objects:")
-        for obj in objects:
-            area_pct = (obj["bbox_norm"][2] - obj["bbox_norm"][0]) * (obj["bbox_norm"][3] - obj["bbox_norm"][1]) * 100
-            print(f"    {obj['name']}: {obj['bbox_pixel']} ({area_pct:.1f}% area)")
+        # Get object detections (from Qwen VL or cache)
+        if args.skip_qwen:
+            # Load cached detections from existing per-sample files
+            cached_file = os.path.join(mask_dir, f"{group[0]['id']:03d}.pt")
+            if os.path.exists(cached_file):
+                cached = torch.load(cached_file, weights_only=False)
+                objects = cached.get("objects", [])
+                print(f"  Loaded {len(objects)} cached detections")
+            else:
+                print(f"  WARNING: No cached detections for {video_id}, skipping")
+                continue
+        else:
+            response = detect_objects(qwen_model, qwen_processor, frame_path)
+            objects = parse_objects(response, img.width, img.height)
+            print(f"  Detected {len(objects)} objects:")
+            for obj in objects:
+                area_pct = (obj["bbox_norm"][2] - obj["bbox_norm"][0]) * (obj["bbox_norm"][3] - obj["bbox_norm"][1]) * 100
+                print(f"    {obj['name']}: {obj['bbox_pixel']} ({area_pct:.1f}% area)")
 
-        if len(objects) == 0:
-            print(f"  WARNING: No objects detected, raw response:\n{response[:200]}")
+            if len(objects) == 0:
+                print(f"  WARNING: No objects detected, raw response:\n{response[:200]}")
 
-        # Convert to latent-resolution masks
-        # LTX-2 latent: [C, F, H_lat, W_lat] where for 768x1152: H_lat=36, W_lat=24
+        # Generate masks: SAM silhouettes or bbox rectangles
         latent_h, latent_w = 36, 24
-        masks = objects_to_masks(objects, latent_h, latent_w)
-        print(f"  Masks shape: {masks.shape} (latent {latent_h}x{latent_w})")
+        if sam_predictor is not None and len(objects) > 0:
+            masks = objects_to_masks_sam(objects, img, sam_predictor, latent_h, latent_w)
+            print(f"  SAM masks: {masks.shape} (latent {latent_h}x{latent_w})")
+        else:
+            masks = objects_to_masks_bbox(objects, latent_h, latent_w)
+            print(f"  Bbox masks: {masks.shape} (latent {latent_h}x{latent_w})")
 
         # Visualization
         if args.viz:
@@ -333,24 +440,30 @@ def main():
             visualize_detections(frame_path, objects, viz_path)
             print(f"  Viz saved: {viz_path}")
 
-        # Store results for this scene
+        # Store results for this scene (strip pixel_mask numpy arrays to save memory)
         all_results[video_id] = {
             "objects": objects,
             "masks": masks,
-            "response": response,
             "frame_path": frame_path,
             "frame_size": img.size,
         }
+
+        # Clean objects for serialization: strip pixel_mask (large numpy arrays)
+        objects_clean = []
+        for obj in objects:
+            obj_clean = {k: v for k, v in obj.items() if k != "pixel_mask"}
+            objects_clean.append(obj_clean)
 
         # Save per-sample mask files
         for pair in group:
             idx = pair["id"]
             save_data = {
                 "video_id": video_id,
-                "objects": objects,
+                "objects": objects_clean,
                 "masks": masks,  # [N_objects, H_lat, W_lat]
                 "frame_size": img.size,
                 "num_objects": len(objects),
+                "mask_type": "sam" if sam_predictor is not None else "bbox",
             }
             save_path = os.path.join(mask_dir, f"{idx:03d}.pt")
             torch.save(save_data, save_path)
@@ -361,7 +474,7 @@ def main():
     print(f"\n{'='*60}")
     print("SUMMARY")
     print(f"{'='*60}")
-    total_saved = len([f for f in os.listdir(mask_dir) if f.endswith(".pt")])
+    total_saved = len([f for f in os.listdir(mask_dir) if f.endswith(".pt") and not f.startswith("_")])
     print(f"Total mask files saved: {total_saved}")
     print(f"Output directory: {mask_dir}")
 

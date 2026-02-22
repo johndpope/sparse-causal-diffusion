@@ -1,5 +1,36 @@
 # Changelog
 
+## [2026-02-23] SAM Pixel-Accurate Silhouette Masks
+
+### Problem
+Qwen VL detections only give bounding boxes → `objects_to_masks()` filled rectangular masks.
+The model trained on rectangles, not real object shapes (person outline, bottle contour, etc.).
+
+### Solution: SAM (Segment Anything) Integration
+1. **`compute_semantic_masks.py`** — Added SAM ViT-H pipeline:
+   - `load_sam()` — Loads SAM ViT-H from checkpoint
+   - `objects_to_masks_sam()` — Feeds Qwen VL bboxes as SAM box prompts →
+     pixel-accurate segmentation → `adaptive_max_pool2d` downsample to latent grid
+   - `objects_to_masks_bbox()` — Fallback rectangular masks (`--no-sam`)
+   - `--skip-qwen` flag: Reuse cached Qwen VL detections, only re-run SAM (saves ~5min per run)
+   - `--viz` flag: Overlays SAM silhouettes with semi-transparent colors
+
+2. **Mask quality**: Irregularity scores (0=rectangle, 1=no fill):
+   - WOMAN: 25-47% (person contour vs bounding box)
+   - WINE BOTTLE: 41% (bottle shape)
+   - Previously: 0% (all pure rectangles)
+
+### Training Restart (3rd run)
+- Run 1: MuLAn masks (random shapes from unrelated COCO/LAION images) → killed at step ~411
+- Run 2: Qwen VL bbox masks (per-sample but still rectangles) → killed at step ~388
+- Run 3: SAM silhouette masks (pixel-accurate object shapes) → started from step 0
+- WandB: https://wandb.ai/snoozie/editctrl-scd/runs/r29tbg67
+
+### Bug Fix
+- `trainer.py` debug image: Fixed device mismatch (`edit_mask` on cuda:0 vs decoded frames on CPU)
+
+---
+
 ## [2026-02-23] Qwen VL Semantic Object Masks + Per-Sample Targeting
 
 ### Problem
@@ -25,21 +56,6 @@ random rectangle.
 - Mask coverage varies naturally per object: 0.3% (wine glass) → 33% (bar counter)
 - TMA semantic tokens now align with edit region (model learns "this region is a Person")
 - 128 per-sample mask files, 4-34 objects detected per scene
-
-### Debug Visualization
-- `trainer.py` — Added 4th column to debug_decoded.png: red mask overlay showing targeted region
-- `outputs/editctrl_scd_tma/debug_mask_overlay.png` — Standalone overlay visualization
-
-### Training Restart Context
-- Previous run reached step ~411 with MuLAn masks (random shapes from other images)
-- Restarted from step 0 with per-sample Qwen VL object masks
-- No checkpoint to resume (checkpoints save every 500 steps)
-- WandB: https://wandb.ai/snoozie/editctrl-scd
-
-### Known Issue: Masks Are Still Bounding Boxes
-The current `objects_to_masks()` fills rectangular bounding boxes from Qwen VL detections.
-**Next step**: Pipe Qwen VL bboxes through SAM (Segment Anything) for pixel-accurate
-silhouette masks (person outline, bottle shape, etc. instead of rectangles).
 
 ---
 
