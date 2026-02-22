@@ -112,10 +112,10 @@ training_strategy:
   tma_num_queries: 8            # 8 MetaQuery tokens per task
   tma_connector_layers: 3       # 3-layer MLP connector
   tma_features_dir: qwen_vl_features  # Subdirectory in preprocessed_data_root
-  # Mask generation settings (MuLAn dataset integration)
-  mask_source: random                  # random | semantic | mixed
-  semantic_mask_dir: null              # Path to pre-extracted MuLAn mask library (e.g., /media/2TB/mulan_masks)
-  semantic_mask_ratio: 0.5             # Fraction of samples using semantic masks in "mixed" mode
+  # Mask generation settings — per-sample Qwen VL object detections
+  mask_source: mixed                   # random | semantic | mixed
+  semantic_mask_dir: /media/2TB/isometric_i2v_training/semantic_masks  # Qwen VL per-sample object masks
+  semantic_mask_ratio: 0.7             # 70% real object masks, 30% random (for diversity)
 
 checkpoints:
   interval: 500

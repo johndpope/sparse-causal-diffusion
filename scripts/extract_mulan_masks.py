@@ -2,17 +2,35 @@
 """Extract instance masks from MuLAn dataset for training data augmentation.
 
 MuLAn (CVPR 2024) provides 44K+ images with multi-layer RGBA instance
-decompositions. This script extracts the alpha channels from decomposed
-layers and saves them as compact tensor files for use as diverse edit masks
-during EditCtrl training.
+decompositions. This script extracts instance alpha masks and saves them as
+compact tensor files for use as diverse edit masks during EditCtrl training.
 
-Input: MuLAn decomposed output directory (from dataset_decomposition.py)
-    images/
-        {image_id}/
-            layer_0.png  (background, full alpha)
-            layer_1.png  (instance 1, with alpha channel)
-            layer_2.png  (instance 2, with alpha channel)
-            ...
+Supports two input modes:
+
+1. ANNOTATION MODE (--mode annotations, recommended):
+   Reads .p.zl annotation files directly. Each contains instance_alpha
+   masks. Does NOT require the original COCO/LAION base images.
+
+   Input: directory of .p.zl files (extracted from MuLAn RAR archive)
+   Usage:
+       unrar x -e /media/12TB/mulan_raw/mulan.part001.rar /media/12TB/mulan_annotations/
+       python scripts/extract_mulan_masks.py \
+           --mode annotations \
+           --input_dir /media/12TB/mulan_annotations \
+           --output_dir /media/12TB/mulan_masks \
+           --target_size 64 --workers 8
+
+2. DECOMPOSED MODE (--mode decomposed):
+   Reads decomposed PNG layers from dataset_decomposition.py output.
+   Requires running the full decomposition pipeline first (needs COCO images).
+
+   Input: directory of {image_id}/ subdirs with layer_*.png files
+   Usage:
+       python scripts/extract_mulan_masks.py \
+           --mode decomposed \
+           --input_dir /media/2TB/mulan_layers/images \
+           --output_dir /media/2TB/mulan_masks \
+           --target_size 64 --workers 8
 
 Output: Compact mask library directory
     masks/
@@ -20,16 +38,6 @@ Output: Compact mask library directory
             masks: [N, H, W] float32 alpha masks (N = number of instances)
             areas: [N] float32 area fractions for each mask
             image_size: (H, W) original image dimensions
-
-Usage:
-    python scripts/extract_mulan_masks.py \
-        --input_dir /media/2TB/mulan_layers/images \
-        --output_dir /media/2TB/mulan_masks \
-        --min_area 0.01 \
-        --max_area 0.8 \
-        --max_instances 10 \
-        --target_size 64 \
-        --workers 8
 """
 
 from __future__ import annotations
@@ -39,11 +47,148 @@ import os
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
+import pickle
+import zlib
+
 import torch
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
+
+# --------------------------------------------------------------------------- #
+#  Mode 1: Extract from .p.zl annotation files (no COCO images needed)
+# --------------------------------------------------------------------------- #
+
+def extract_masks_from_annotation(
+    pzl_path: Path,
+    min_area: float = 0.01,
+    max_area: float = 0.8,
+    max_instances: int = 10,
+    target_size: int | None = None,
+) -> dict | None:
+    """Extract instance masks from a MuLAn .p.zl annotation file.
+
+    The annotation pickle contains instance_alpha (PIL Image alpha channel)
+    and original_image_mask (numpy array) for each instance. We extract
+    the instance_alpha directly — no base image needed.
+
+    Args:
+        pzl_path: Path to .p.zl annotation file
+        min_area: Minimum mask area fraction
+        max_area: Maximum mask area fraction
+        max_instances: Maximum instances per image
+        target_size: Resize masks to this square size
+
+    Returns:
+        Dict with masks, areas, image_size, or None if no valid masks
+    """
+    try:
+        with open(pzl_path, "rb") as f:
+            annotation = pickle.loads(zlib.decompress(f.read()))
+    except Exception:
+        return None
+
+    instances = annotation.get("instances", {})
+    if not instances:
+        return None
+
+    masks = []
+    areas = []
+    img_size = None
+
+    for inst_key, inst_data in instances.items():
+        if len(masks) >= max_instances:
+            break
+
+        # Try instance_alpha first (PIL Image), then original_image_mask (numpy)
+        alpha = None
+
+        if "instance_alpha" in inst_data:
+            alpha_img = inst_data["instance_alpha"]
+            if isinstance(alpha_img, Image.Image):
+                alpha = np.array(alpha_img, dtype=np.float32) / 255.0
+            elif isinstance(alpha_img, np.ndarray):
+                alpha = alpha_img.astype(np.float32)
+                if alpha.max() > 1.0:
+                    alpha = alpha / 255.0
+
+        if alpha is None and "original_image_mask" in inst_data:
+            mask_arr = inst_data["original_image_mask"]
+            if isinstance(mask_arr, np.ndarray):
+                alpha = mask_arr.astype(np.float32)
+                if alpha.max() > 1.0:
+                    alpha = alpha / 255.0
+                # Handle multi-channel masks
+                if alpha.ndim == 3:
+                    alpha = alpha.mean(axis=-1)
+
+        if alpha is None:
+            continue
+
+        # Handle 2D vs squeezable
+        if alpha.ndim != 2:
+            alpha = alpha.squeeze()
+        if alpha.ndim != 2:
+            continue
+
+        if img_size is None:
+            img_size = alpha.shape
+
+        # Binarize
+        binary = (alpha > 0.5).astype(np.float32)
+        area = binary.mean()
+
+        if area < min_area or area > max_area:
+            continue
+
+        masks.append(binary)
+        areas.append(area)
+
+    if not masks:
+        return None
+
+    H, W = masks[0].shape
+    mask_tensor = torch.from_numpy(np.stack(masks))  # [N, H, W]
+
+    if target_size is not None and (H != target_size or W != target_size):
+        mask_tensor = torch.nn.functional.interpolate(
+            mask_tensor.unsqueeze(1),
+            size=(target_size, target_size),
+            mode="nearest",
+        ).squeeze(1)
+
+    return {
+        "masks": mask_tensor,
+        "areas": torch.tensor(areas, dtype=torch.float32),
+        "image_size": (H, W),
+    }
+
+
+def process_one_annotation(args_tuple):
+    """Worker function for annotation mode."""
+    pzl_path, min_area, max_area, max_instances, target_size, output_dir = args_tuple
+    image_id = pzl_path.stem.replace(".p", "")  # Remove .p from {id}.p.zl
+    output_path = output_dir / f"{image_id}.pt"
+
+    if output_path.exists():
+        return image_id, True, "skipped (exists)"
+
+    result = extract_masks_from_annotation(
+        pzl_path, min_area, max_area, max_instances, target_size
+    )
+
+    if result is None:
+        return image_id, False, "no valid masks"
+
+    torch.save(result, output_path)
+    n = result["masks"].shape[0]
+    return image_id, True, f"{n} masks"
+
+
+# --------------------------------------------------------------------------- #
+#  Mode 2: Extract from decomposed PNG layers
+# --------------------------------------------------------------------------- #
 
 def extract_masks_from_image(
     image_dir: Path,
@@ -177,8 +322,13 @@ def build_index(output_dir: Path) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Extract instance masks from MuLAn dataset")
+    parser.add_argument("--mode", type=str, default="annotations",
+                        choices=["annotations", "decomposed"],
+                        help="Input mode: 'annotations' reads .p.zl files directly "
+                             "(no COCO images needed), 'decomposed' reads PNG layers")
     parser.add_argument("--input_dir", type=str, required=True,
-                        help="MuLAn decomposed images directory")
+                        help="Input directory (annotations: dir of .p.zl files; "
+                             "decomposed: dir of image subdirectories)")
     parser.add_argument("--output_dir", type=str, required=True,
                         help="Output directory for mask library")
     parser.add_argument("--min_area", type=float, default=0.01,
@@ -208,30 +358,57 @@ def main():
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Find all image directories
-    image_dirs = sorted([d for d in input_dir.iterdir() if d.is_dir()])
-    if not image_dirs:
-        print(f"No image directories found in {input_dir}")
-        return
+    if args.mode == "annotations":
+        # Mode 1: Read .p.zl annotation files directly
+        pzl_files = sorted(input_dir.glob("*.p.zl"))
+        if not pzl_files:
+            # Also check for nested structure
+            pzl_files = sorted(input_dir.rglob("*.p.zl"))
+        if not pzl_files:
+            print(f"No .p.zl annotation files found in {input_dir}")
+            return
 
-    print(f"Found {len(image_dirs)} image directories in {input_dir}")
-    print(f"Output: {output_dir}")
-    print(f"Filter: area [{args.min_area:.2f}, {args.max_area:.2f}], "
-          f"max {args.max_instances} instances/image")
-    if target_size:
-        print(f"Resize: {target_size}x{target_size}")
+        print(f"Mode: annotations (direct .p.zl extraction, no COCO images needed)")
+        print(f"Found {len(pzl_files)} annotation files in {input_dir}")
+        print(f"Output: {output_dir}")
+        print(f"Filter: area [{args.min_area:.2f}, {args.max_area:.2f}], "
+              f"max {args.max_instances} instances/image")
+        if target_size:
+            print(f"Resize: {target_size}x{target_size}")
+
+        work_items = [
+            (f, args.min_area, args.max_area, args.max_instances, target_size, output_dir)
+            for f in pzl_files
+        ]
+        worker_fn = process_one_annotation
+
+    else:
+        # Mode 2: Read decomposed PNG layers
+        image_dirs = sorted([d for d in input_dir.iterdir() if d.is_dir()])
+        if not image_dirs:
+            print(f"No image directories found in {input_dir}")
+            return
+
+        print(f"Mode: decomposed (PNG layers)")
+        print(f"Found {len(image_dirs)} image directories in {input_dir}")
+        print(f"Output: {output_dir}")
+        print(f"Filter: area [{args.min_area:.2f}, {args.max_area:.2f}], "
+              f"max {args.max_instances} instances/image")
+        if target_size:
+            print(f"Resize: {target_size}x{target_size}")
+
+        work_items = [
+            (d, args.min_area, args.max_area, args.max_instances, target_size, output_dir)
+            for d in image_dirs
+        ]
+        worker_fn = process_one_image
 
     # Process in parallel
-    work_items = [
-        (d, args.min_area, args.max_area, args.max_instances, target_size, output_dir)
-        for d in image_dirs
-    ]
-
     success = 0
     failed = 0
 
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(process_one_image, item): item[0] for item in work_items}
+        futures = {executor.submit(worker_fn, item): item[0] for item in work_items}
 
         for future in tqdm(as_completed(futures), total=len(futures), desc="Extracting masks"):
             image_id, ok, msg = future.result()
@@ -240,7 +417,7 @@ def main():
             else:
                 failed += 1
 
-    print(f"\nDone! Processed {success + failed} images: {success} success, {failed} no valid masks")
+    print(f"\nDone! Processed {success + failed} items: {success} success, {failed} no valid masks")
 
     # Build index
     build_index(output_dir)
