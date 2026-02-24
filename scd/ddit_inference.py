@@ -13,8 +13,14 @@ The wrapper intercepts the decoder forward pass:
 The encoder ALWAYS runs at native resolution (runs once, needs full detail).
 Only the decoder benefits from DDiT (runs N times per frame).
 
+Loading LoRA (optional, improves quality):
+    DDiT training jointly optimizes adapter weights AND LoRA on transformer blocks.
+    At inference, loading the LoRA weights lets the transformer better handle
+    merged tokens. Without LoRA, the adapter still works but quality is lower.
+
 Usage in pipeline:
     ddit_wrapper = DDiTInferenceWrapper(scd_model, ddit_adapter)
+    ddit_wrapper.load_lora("outputs/ddit_adapter/ddit_lora_final.safetensors")
     ddit_wrapper.reset()
 
     for step_idx, sigma in enumerate(sigmas):
@@ -32,6 +38,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 from torch import Tensor
+
+from safetensors.torch import load_file
 
 from ltx_core.model.transformer.ddit import DDiTAdapter, DDiTConfig
 from ltx_core.model.transformer.modality import Modality
@@ -51,6 +59,137 @@ class DDiTInferenceWrapper:
         self.adapter = ddit_adapter
         self.verbose = verbose
         self._step_scales: list[int] = []  # Track scale per step for logging
+        self._lora_loaded = False
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        scd_model: LTXSCDModel,
+        adapter_path: str,
+        lora_path: str | None = None,
+        config_path: str | None = None,
+        verbose: bool = True,
+    ) -> "DDiTInferenceWrapper":
+        """Create wrapper from saved checkpoint files.
+
+        Args:
+            scd_model: SCD model instance
+            adapter_path: Path to ddit_adapter_final.safetensors
+            lora_path: Optional path to ddit_lora_final.safetensors
+            config_path: Optional path to ddit_config.json (auto-detected if None)
+            verbose: Print loading info
+        """
+        import json
+        from pathlib import Path
+
+        adapter_dir = Path(adapter_path).parent
+
+        # Load config
+        if config_path is None:
+            config_path = adapter_dir / "ddit_config.json"
+        if Path(config_path).exists():
+            with open(config_path) as f:
+                cfg = json.load(f)
+            scales = tuple(cfg.get("scales", [2, 4]))
+            lora_rank = cfg.get("lora_rank", 32)
+        else:
+            scales = (2, 4)
+            lora_rank = 32
+
+        # Create adapter
+        config = DDiTConfig(
+            enabled=True,
+            supported_scales=(1, *scales),
+            lora_rank=lora_rank,
+        )
+        adapter = DDiTAdapter(
+            inner_dim=scd_model.base_model.inner_dim,
+            in_channels=128,
+            config=config,
+        )
+
+        # Load adapter weights
+        state = load_file(adapter_path)
+        adapter.load_state_dict(state)
+        device = next(scd_model.base_model.parameters()).device
+        adapter = adapter.to(device=device, dtype=torch.bfloat16)
+        if verbose:
+            print(f"DDiT adapter loaded from {adapter_path}")
+
+        wrapper = cls(scd_model, adapter, verbose=verbose)
+
+        # Load LoRA if available
+        if lora_path is None:
+            lora_path = adapter_dir / "ddit_lora_final.safetensors"
+        if Path(lora_path).exists():
+            wrapper.load_lora(str(lora_path))
+
+        return wrapper
+
+    def load_lora(self, lora_path: str) -> None:
+        """Load LoRA weights into the SCD model's base transformer.
+
+        Applies PEFT LoRA to the base model and loads trained weights.
+        This improves DDiT quality by letting the transformer adapt its
+        attention/FF patterns for merged tokens.
+        """
+        from peft import LoraConfig, get_peft_model
+
+        base_model = self.scd_model.base_model
+        lora_state = load_file(lora_path)
+
+        # Determine LoRA config from saved weights
+        # Find rank from lora_A shape
+        rank = 32  # default
+        for k, v in lora_state.items():
+            if 'lora_A' in k:
+                rank = v.shape[0]
+                break
+
+        # Determine targets from saved keys
+        targets = set()
+        for k in lora_state.keys():
+            # Key format: base_model.model.transformer_blocks.0.attn1.to_q.lora_A.default.weight
+            parts = k.split('.')
+            for i, part in enumerate(parts):
+                if part in ('to_q', 'to_k', 'to_v'):
+                    targets.add(part)
+                elif part == 'to_out' and i + 1 < len(parts) and parts[i + 1] == '0':
+                    targets.add('to_out.0')
+                elif part == 'net' and i + 1 < len(parts):
+                    if parts[i + 1] == '0' and i + 2 < len(parts) and parts[i + 2] == 'proj':
+                        targets.add('net.0.proj')
+                    elif parts[i + 1] == '2':
+                        targets.add('net.2')
+
+        if not targets:
+            targets = {"to_q", "to_k", "to_v", "to_out.0"}
+
+        # Apply PEFT LoRA
+        config = LoraConfig(
+            r=rank,
+            lora_alpha=rank,
+            target_modules=list(targets),
+            lora_dropout=0.0,
+        )
+
+        # Freeze base model first
+        for p in base_model.parameters():
+            p.requires_grad_(False)
+
+        peft_model = get_peft_model(base_model, config)
+
+        # Load trained LoRA weights
+        missing, unexpected = peft_model.load_state_dict(lora_state, strict=False)
+        loaded = len(lora_state) - len(missing)
+
+        # Replace base model reference in SCD model
+        self.scd_model.base_model = peft_model
+        peft_model.eval()
+        self._lora_loaded = True
+
+        if self.verbose:
+            print(f"DDiT LoRA loaded: {loaded} tensors, rank={rank}, targets={targets}")
 
     def reset(self) -> None:
         """Reset for a new generation. Call before each video."""

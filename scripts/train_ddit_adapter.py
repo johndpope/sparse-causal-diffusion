@@ -20,17 +20,19 @@ Usage:
         --steps 200 \
         --lr 5e-4
 
-    # Phase 2 (after phase 1):
+    # Phase 2 with LoRA (after phase 1):
     python scripts/train_ddit_adapter.py \
         --model_path /media/2TB/ltx-models/ltx2/ltx-2-19b-dev.safetensors \
         --data_root /media/2TB/isometric_i2v_training \
         --output_dir outputs/ddit_adapter \
-        --device cuda:1 \
+        --device cuda:0 \
         --scales 2,4 \
         --phase 2 \
         --resume outputs/ddit_adapter/ddit_adapter_phase1.safetensors \
-        --steps 300 \
-        --lr 1e-4
+        --steps 500 \
+        --lr 1e-4 \
+        --use_lora \
+        --lora_target both
 """
 
 import argparse
@@ -141,6 +143,83 @@ def load_base_model(model_path: str, device: str = "cuda:1", quantize: bool = Tr
 
     vram = torch.cuda.memory_allocated(device) / 1e9
     print(f"  Model on {device}: inner_dim={model.inner_dim}, VRAM={vram:.1f}GB")
+    return model
+
+
+def setup_lora(model, lora_rank=32, lora_alpha=32, target="both"):
+    """Apply PEFT LoRA to transformer blocks for DDiT distillation.
+
+    LoRA gives the frozen transformer capacity to adapt its attention patterns
+    for merged (coarser) tokens. Without it, the model can't compensate for
+    spatial information loss during token merging.
+
+    The DDiT paper applies LoRA to FFN layers. We also support attention-only
+    or both attention+FFN targets.
+
+    Args:
+        model: LTXModel (quantized, frozen)
+        lora_rank: LoRA rank (default 32, matching paper)
+        lora_alpha: LoRA alpha scaling (default 32 = scaling factor of 1.0)
+        target: "ff" (paper default), "attn", or "both"
+
+    Returns:
+        PeftModel wrapping the original model with LoRA adapters
+    """
+    from peft import LoraConfig as PeftLoraConfig, get_peft_model
+
+    if target == "ff":
+        target_modules = ["net.0.proj", "net.2"]
+    elif target == "attn":
+        target_modules = ["to_q", "to_k", "to_v", "to_out.0"]
+    else:  # both
+        target_modules = [
+            "to_q", "to_k", "to_v", "to_out.0",  # attention projections
+            "net.0.proj",  # FF up-projection (GEGLU)
+            "net.2",       # FF down-projection
+        ]
+
+    lora_config = PeftLoraConfig(
+        r=lora_rank,
+        lora_alpha=lora_alpha,
+        target_modules=target_modules,
+        lora_dropout=0.0,
+        init_lora_weights=True,
+    )
+
+    model = get_peft_model(model, lora_config)
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"  LoRA applied ({target}): {trainable:,} trainable / {total:,} total "
+          f"({100*trainable/total:.2f}%)")
+    print(f"  LoRA targets: {target_modules}")
+    return model
+
+
+def get_lora_params(model):
+    """Extract LoRA trainable parameters from a PEFT-wrapped model."""
+    return [p for p in model.parameters() if p.requires_grad]
+
+
+def save_lora_weights(model, path):
+    """Save only LoRA weights from a PEFT-wrapped model."""
+    lora_state = {}
+    for k, v in model.state_dict().items():
+        if 'lora_' in k:
+            lora_state[k] = v.contiguous().to(torch.bfloat16)
+    save_file(lora_state, str(path))
+    print(f"  Saved LoRA weights: {path} ({len(lora_state)} tensors)")
+    return lora_state
+
+
+def load_lora_weights(model, path):
+    """Load LoRA weights into a PEFT-wrapped model."""
+    lora_state = load_file(str(path))
+    missing, unexpected = model.load_state_dict(lora_state, strict=False)
+    loaded = len(lora_state) - len(missing)
+    print(f"  Loaded LoRA weights: {path} ({loaded} tensors)")
+    if missing:
+        print(f"  WARNING: {len(missing)} missing LoRA keys")
     return model
 
 
@@ -353,8 +432,13 @@ def train_phase1(adapter, samples, args):
 # ---------------------------------------------------------------------------
 # Phase 2: Full distillation through base model
 # ---------------------------------------------------------------------------
-def get_teacher_output(base_model, latent, positions, dummy_ctx, dummy_mask, sigma, device):
-    """Teacher: base model forward at native resolution (no_grad)."""
+def get_teacher_output(base_model, latent, positions, dummy_ctx, dummy_mask,
+                       sigma, device, use_lora=False):
+    """Teacher: base model forward at native resolution (no_grad).
+
+    When use_lora=True, temporarily disables LoRA adapters so the teacher
+    produces ground-truth base model outputs (without any adaptation).
+    """
     from ltx_core.model.transformer.modality import Modality
     from ltx_core.guidance.perturbations import BatchedPerturbationConfig
 
@@ -369,8 +453,16 @@ def get_teacher_output(base_model, latent, positions, dummy_ctx, dummy_mask, sig
     )
     perturbations = BatchedPerturbationConfig.empty(B)
 
+    # Disable LoRA for teacher pass — we want pure base model output
+    if use_lora:
+        base_model.disable_adapter_layers()
+
     with torch.no_grad():
         output, _ = base_model(video=modality, audio=None, perturbations=perturbations)
+
+    # Re-enable LoRA for student pass
+    if use_lora:
+        base_model.enable_adapter_layers()
 
     return output, noisy  # Return noisy latent so student uses same noise
 
@@ -378,7 +470,13 @@ def get_teacher_output(base_model, latent, positions, dummy_ctx, dummy_mask, sig
 def get_student_output(base_model, adapter, noisy_latent, positions,
                        dummy_ctx, dummy_mask, sigma, scale,
                        nf, h, w, device):
-    """Student: merge → base model → unmerge at coarse resolution."""
+    """Student: merge → base model (with LoRA) → unmerge at coarse resolution.
+
+    When base_model is PEFT-wrapped, LoRA adapters are active during this pass,
+    allowing the transformer to adapt attention/FF for merged tokens.
+    PEFT's __getattr__ delegates attribute access (patchify_proj, norm_out, etc.)
+    to the underlying LTXModel transparently.
+    """
     from ltx_core.model.transformer.modality import Modality
     from ltx_core.guidance.perturbations import BatchedPerturbationConfig
 
@@ -405,7 +503,10 @@ def get_student_output(base_model, adapter, noisy_latent, positions,
     )
 
     # Cast dtype to match patchify_proj (float32 when excluded from quantization)
-    target_dtype = base_model.patchify_proj.weight.dtype
+    # Works through PEFT wrapper via __getattr__ → base_model.model.patchify_proj
+    real_model = getattr(base_model, 'base_model', base_model)
+    real_model = getattr(real_model, 'model', real_model)
+    target_dtype = real_model.patchify_proj.weight.dtype
     if dummy_mod.latent.dtype != target_dtype:
         dummy_mod = Modality(
             enabled=dummy_mod.enabled, latent=dummy_mod.latent.to(target_dtype),
@@ -413,7 +514,7 @@ def get_student_output(base_model, adapter, noisy_latent, positions,
             context=dummy_mod.context, context_mask=dummy_mod.context_mask,
         )
 
-    video_args = base_model.video_args_preprocessor.prepare(dummy_mod)
+    video_args = real_model.video_args_preprocessor.prepare(dummy_mod)
 
     # 4. Swap in our DDiT-projected tokens
     video_args = replace(video_args, x=projected.to(video_args.x.dtype))
@@ -423,9 +524,10 @@ def get_student_output(base_model, adapter, noisy_latent, positions,
     # 5. Run through transformer blocks with gradient checkpointing
     # Temporarily set training=True to enable gradient checkpointing
     # (checkpointing is gated on `self.training` in _process_transformer_blocks)
+    # With PEFT: train() propagates to all submodules including LoRA layers
     was_training = base_model.training
     base_model.train()
-    video_out, _ = base_model._process_transformer_blocks(
+    video_out, _ = real_model._process_transformer_blocks(
         video=video_args, audio=None, perturbations=perturbations,
     )
     if not was_training:
@@ -434,11 +536,11 @@ def get_student_output(base_model, adapter, noisy_latent, positions,
     # 6. Output processing: norm + scale_shift + proj_out
     x = video_out.x
     emb_ts = video_out.embedded_timestep
-    scale_shift = base_model.scale_shift_table
+    scale_shift = real_model.scale_shift_table
     shift, scale_val = (
         scale_shift[None, None].to(device=x.device, dtype=x.dtype) + emb_ts[:, :, None]
     ).unbind(dim=2)
-    x = base_model.norm_out(x)
+    x = real_model.norm_out(x)
     x = x * (1 + scale_val) + shift
 
     # 7. Use DDiT proj_out instead of base proj_out
@@ -455,8 +557,13 @@ def get_student_output(base_model, adapter, noisy_latent, positions,
     return output
 
 
-def train_phase2(base_model, adapter, samples, args):
-    """Distillation training through frozen base model."""
+def train_phase2(base_model, adapter, samples, args, use_lora=False):
+    """Distillation training through frozen base model.
+
+    When use_lora=True, the base_model is a PeftModel with LoRA adapters.
+    LoRA is disabled for teacher pass (ground truth) and enabled for student
+    pass (adaptation). Both adapter and LoRA params are optimized jointly.
+    """
     import os
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -464,13 +571,23 @@ def train_phase2(base_model, adapter, samples, args):
     dtype = torch.bfloat16
     scales = tuple(int(s) for s in args.scales.split(","))
 
-    optimizer = AdamW(adapter.parameters(), lr=args.lr, weight_decay=1e-4)
+    # Collect all trainable parameters: adapter + LoRA
+    trainable_params = list(adapter.parameters())
+    if use_lora:
+        lora_params = get_lora_params(base_model)
+        trainable_params.extend(lora_params)
+        print(f"  Optimizer: {sum(p.numel() for p in adapter.parameters()):,} adapter + "
+              f"{sum(p.numel() for p in lora_params):,} LoRA = "
+              f"{sum(p.numel() for p in trainable_params):,} total trainable")
+
+    optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=1e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.steps, eta_min=args.lr * 0.1)
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n=== Phase 2: Distillation training ({args.steps} steps) ===")
+    lora_tag = " + LoRA" if use_lora else ""
+    print(f"\n=== Phase 2: Distillation training{lora_tag} ({args.steps} steps) ===")
     print(f"  Scales: {scales}, LR: {args.lr}")
     vram = torch.cuda.memory_allocated(device) / 1e9
     print(f"  VRAM before training: {vram:.1f}GB")
@@ -489,40 +606,43 @@ def train_phase2(base_model, adapter, samples, args):
             # Random sigma for this step
             sigma = torch.rand(1).item() * 0.9 + 0.05  # [0.05, 0.95]
 
-            # Teacher: full-res forward (no_grad, low memory)
+            # Teacher: full-res forward (no_grad, LoRA disabled for base model output)
             teacher_out, noisy = get_teacher_output(
-                base_model, latent, positions, text_ctx, text_mask, sigma, device
+                base_model, latent, positions, text_ctx, text_mask, sigma, device,
+                use_lora=use_lora,
             )
             # Detach teacher to free its computation graph
             teacher_out = teacher_out.detach()
             del latent  # Free input latent
             torch.cuda.empty_cache()
 
-            # Process one scale at a time to minimize peak VRAM
+            # Accumulate gradients across all scales, then do one optimizer step.
+            # This is critical when using LoRA: shared LoRA params would get
+            # conflicting updates if we stepped per-scale.
             step_losses = []
-            for scale in scales:
-                if h % scale != 0 or w % scale != 0:
-                    continue
+            valid_scales = [s for s in scales if h % s == 0 and w % s == 0]
+            optimizer.zero_grad()
 
-                # Student: coarse-res forward (gradients flow through adapter)
+            for scale in valid_scales:
+                # Student: coarse-res forward (gradients through adapter + LoRA)
                 student_out = get_student_output(
                     base_model, adapter, noisy, positions,
                     text_ctx, text_mask, sigma, scale, nf, h, w, device,
                 )
 
-                loss = F.mse_loss(student_out, teacher_out)
+                # Normalize loss by number of scales for balanced gradients
+                loss = F.mse_loss(student_out, teacher_out) / len(valid_scales)
 
-                # Backward per-scale to free activations immediately
-                optimizer.zero_grad()
+                # Backward accumulates gradients; frees activations per-scale
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(adapter.parameters(), 1.0)
-                optimizer.step()
-                step_losses.append(loss.item())
+                step_losses.append(loss.item() * len(valid_scales))  # Log unnormalized
 
                 del student_out, loss
                 torch.cuda.empty_cache()
 
             if step_losses:
+                torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+                optimizer.step()
                 scheduler.step()
                 losses.append(sum(step_losses) / len(step_losses))
 
@@ -540,14 +660,22 @@ def train_phase2(base_model, adapter, samples, args):
                       f"Peak VRAM: {vram:.1f}GB | {elapsed:.0f}s")
 
             if step % args.save_interval == 0:
+                # Save adapter
                 path = out_dir / f"ddit_adapter_p2_step{step:05d}.safetensors"
                 save_file(dict(adapter.state_dict()), str(path))
-                print(f"  Saved: {path}")
+                print(f"  Saved adapter: {path}")
+                # Save LoRA
+                if use_lora:
+                    lora_path = out_dir / f"ddit_lora_p2_step{step:05d}.safetensors"
+                    save_lora_weights(base_model, lora_path)
 
     # Final save
     path = out_dir / "ddit_adapter_final.safetensors"
     save_file(dict(adapter.state_dict()), str(path))
     print(f"\nPhase 2 complete! {path}")
+    if use_lora:
+        lora_path = out_dir / "ddit_lora_final.safetensors"
+        save_lora_weights(base_model, lora_path)
     if losses:
         print(f"  Final loss: {losses[-1]:.6f}")
     return adapter
@@ -575,10 +703,20 @@ def train(args):
         # Phase 2: distillation (needs base model)
         base_model = load_base_model(args.model_path, device, quantize=True)
 
+        # Initialize adapter from base model BEFORE applying LoRA
         adapter = create_ddit_adapter(
             scales=scales, lora_rank=args.lora_rank, device=device,
             base_model=base_model,
         )
+
+        # Apply LoRA to transformer blocks for adaptation capacity
+        use_lora = args.use_lora
+        if use_lora:
+            base_model = setup_lora(
+                base_model, lora_rank=args.lora_rank,
+                lora_alpha=args.lora_rank,  # scaling = alpha/rank = 1.0
+                target=args.lora_target,
+            )
 
         # Load phase 1 weights if resuming
         if args.resume:
@@ -587,7 +725,11 @@ def train(args):
             adapter.load_state_dict(state, strict=False)
             adapter = adapter.to(device=device)
 
-        adapter = train_phase2(base_model, adapter, samples, args)
+        # Load LoRA weights if resuming with LoRA
+        if use_lora and args.resume_lora:
+            load_lora_weights(base_model, args.resume_lora)
+
+        adapter = train_phase2(base_model, adapter, samples, args, use_lora=use_lora)
 
     elif args.phase == 0:
         # Phase 0: both phases sequentially
@@ -606,10 +748,18 @@ def train(args):
         # Phase 2
         base_model = load_base_model(args.model_path, device, quantize=True)
         adapter.init_from_base_model(base_model)
+
+        use_lora = args.use_lora
+        if use_lora:
+            base_model = setup_lora(
+                base_model, lora_rank=args.lora_rank,
+                lora_alpha=args.lora_rank, target=args.lora_target,
+            )
+
         p2_steps = args.steps - p1_steps
         args_p2 = argparse.Namespace(**vars(args))
         args_p2.steps = p2_steps
-        adapter = train_phase2(base_model, adapter, samples, args_p2)
+        adapter = train_phase2(base_model, adapter, samples, args_p2, use_lora=use_lora)
 
     # Save config
     config_path = out_dir / "ddit_config.json"
@@ -624,6 +774,8 @@ def train(args):
             "warmup_steps": 3,
             "phase": args.phase,
             "total_steps": args.steps,
+            "use_lora": getattr(args, 'use_lora', False),
+            "lora_target": getattr(args, 'lora_target', 'both'),
         }, f, indent=2)
     print(f"Config saved: {config_path}")
 
@@ -645,7 +797,18 @@ def main():
     parser.add_argument("--max_samples", type=int, default=128, help="Max training samples")
     parser.add_argument("--save_interval", type=int, default=100, help="Checkpoint interval")
     parser.add_argument("--resume", type=str, default=None, help="Resume from adapter checkpoint")
+    parser.add_argument("--resume_lora", type=str, default=None, help="Resume from LoRA checkpoint")
+    parser.add_argument("--use_lora", action="store_true", default=True,
+                        help="Apply LoRA to transformer blocks (default: True for phase 2)")
+    parser.add_argument("--no_lora", action="store_true", help="Disable LoRA (adapter-only training)")
+    parser.add_argument("--lora_target", type=str, default="both",
+                        choices=["ff", "attn", "both"],
+                        help="LoRA target: ff (paper), attn, or both (default: both)")
     args = parser.parse_args()
+
+    # Handle --no_lora flag
+    if args.no_lora:
+        args.use_lora = False
 
     train(args)
 

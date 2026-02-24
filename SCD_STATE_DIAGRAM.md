@@ -1921,32 +1921,46 @@ Based on [DDiT: Dynamic Patch Scheduling for Efficient Diffusion Transformers](h
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    DDiT Adapter Training                                    │
+│                    DDiT Adapter Training (Two-Phase)                        │
 │                                                                            │
-│  Goal: The model at coarse resolution should produce similar outputs       │
-│  to the model at native resolution.                                        │
+│  Phase 1: RECONSTRUCTION (no base model needed)                            │
+│  ─ Train merge/unmerge layers to preserve spatial information              │
+│  ─ L = MSE(unmerge(merge(z)), z)                                          │
+│  ─ 200 steps, 2 seconds, loss 1.35 → 0.12                                │
 │                                                                            │
-│  ┌──────────┐    same z_t     ┌──────────┐                                │
-│  │ Teacher  │  ─────────────→ │ Student  │                                │
-│  │ (frozen) │  same σ, prompt │ (DDiT)   │                                │
-│  │ scale=1  │                 │ scale=s  │                                │
-│  └────┬─────┘                 └────┬─────┘                                │
-│       │                            │                                       │
-│       ▼                            ▼                                       │
-│  teacher_out                  student_out                                  │
-│  [B,N,128]                    [B,N,128]  (after unmerge)                  │
-│       │                            │                                       │
-│       └──────── L2 Loss ──────────┘                                       │
+│  Phase 2: DISTILLATION (through quantized base model + LoRA)               │
 │                                                                            │
-│  L = ‖ε_θ(z_t^{p_new}, t) - ε_θ(z_t^p, t)‖₂²                          │
+│  ┌──────────────┐  same z_t  ┌──────────────────┐                        │
+│  │ Teacher      │  ────────→ │ Student           │                        │
+│  │ base model   │  same σ    │ DDiT adapter      │                        │
+│  │ LoRA OFF     │            │ + LoRA ON          │                        │
+│  │ scale=1      │            │ scale=s            │                        │
+│  └──────┬───────┘            └──────┬─────────────┘                       │
+│         │                           │                                      │
+│         ▼                           ▼                                      │
+│    teacher_out                 student_out                                 │
+│    [B,N,128]                   [B,N,128]  (after unmerge)                 │
+│         │                           │                                      │
+│         └──────── L2 Loss ─────────┘                                      │
 │                                                                            │
-│  Trainable:   DDiT merge layers + residual blocks + patch_id              │
-│  Frozen:      ALL base model weights (48 transformer blocks)               │
-│  Data:        Synthetic (from base model) or existing latents              │
-│  Cost:        ~500 steps, <1hr on single GPU                              │
-│  Params:      ~2-5M per scale (tiny compared to 19B base)                 │
+│  L = Σ_s ‖ε_θ+LoRA(z_t^{scale=s}, t) - ε_θ(z_t^{scale=1}, t)‖₂²     │
 │                                                                            │
-│  Optimizer: AdamW, lr=1e-4, cosine schedule                               │
+│  CRITICAL: Gradient accumulation across scales (NOT per-scale stepping)    │
+│  ─ LoRA params are SHARED across scales 2 and 4                           │
+│  ─ Per-scale stepping causes conflicting gradient updates (loss stuck ~1.0)│
+│  ─ Accumulated gradients give coherent direction (loss drops to 0.67)      │
+│                                                                            │
+│  Trainable:   DDiT merge layers (21M) + LoRA on attn+FF (308M)           │
+│               = 329M total trainable params                                │
+│  Frozen:      Base model weights (int8-quanto quantized, ~12GB VRAM)       │
+│  LoRA:        rank=32, alpha=32, targets: to_q/k/v/out, net.0.proj, net.2 │
+│  Data:        Pre-encoded latents + Gemma text embeddings                  │
+│  VRAM:        23.3GB peak (fits RTX 5090 33.7GB with room to spare)       │
+│  Speed:       ~2s/step, 500 steps in ~16 minutes                          │
+│                                                                            │
+│  Results:     Loss 1.19 → 0.67 (21% better than adapter-only plateau)     │
+│                                                                            │
+│  Optimizer: AdamW, lr=1e-4, cosine schedule, weight_decay=1e-4            │
 │  Loss: MSE in latent space between teacher and student predictions        │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -2013,8 +2027,13 @@ DDiT Implementation:
 ├── sparse-causal-diffusion/
 │   ├── scd/
 │   │   └── ddit_inference.py          # DDiTInferenceWrapper for pipeline
+│   │                                  # + load_lora(), from_checkpoint()
 │   ├── scripts/
-│   │   └── train_ddit_adapter.py      # Distillation training script
-│   └── configs/
-│       └── ddit_distillation.yaml     # Training config (TODO)
+│   │   └── train_ddit_adapter.py      # Two-phase distillation training
+│   │                                  # + PEFT LoRA integration
+│   └── outputs/ddit_adapter/
+│       ├── ddit_adapter_phase1.safetensors  # Phase 1 weights (21M params)
+│       ├── ddit_adapter_final.safetensors   # Phase 2 adapter weights (21M)
+│       ├── ddit_lora_final.safetensors      # Phase 2 LoRA weights (308M)
+│       └── ddit_config.json                 # Config (scales, rank, targets)
 ```
