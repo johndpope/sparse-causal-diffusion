@@ -42,12 +42,19 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import load_file, save_file
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+
+try:
+    import wandb
+    HAS_WANDB = True
+except ImportError:
+    HAS_WANDB = False
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -60,31 +67,32 @@ def load_base_model(model_path: str, device: str = "cuda:1", quantize: bool = Tr
     print(f"Loading base model from {model_path}...")
     raw_state_dict = load_file(model_path)
 
-    # Strip 'model.diffusion_model.' prefix from checkpoint keys
-    # (the checkpoint uses this prefix, but LTXModel expects bare keys)
+    # Strip 'model.diffusion_model.' prefix and convert to bfloat16 in one pass
+    # to avoid keeping both fp32 and bf16 copies in RAM simultaneously
     PREFIX = "model.diffusion_model."
     state_dict = {}
     for k, v in raw_state_dict.items():
-        if k.startswith(PREFIX):
-            state_dict[k[len(PREFIX):]] = v
-        else:
-            state_dict[k] = v
+        key = k[len(PREFIX):] if k.startswith(PREFIX) else k
+        state_dict[key] = v.to(torch.bfloat16) if v.is_floating_point() else v
     del raw_state_dict
+    import gc; gc.collect()
+    print(f"  State dict: {len(state_dict)} keys (converted to bfloat16)")
 
-    # LTX-2 19B architecture
-    model = LTXModel(
-        num_attention_heads=32,
-        attention_head_dim=128,
-        in_channels=128,
-        out_channels=128,
-        num_layers=48,
-        cross_attention_dim=4096,
-        caption_channels=3840,
-    )
+    # LTX-2 19B architecture — initialize in bfloat16 to avoid fp32 peak
+    with torch.device("meta"):
+        model = LTXModel(
+            num_attention_heads=32,
+            attention_head_dim=128,
+            in_channels=128,
+            out_channels=128,
+            num_layers=48,
+            cross_attention_dim=4096,
+            caption_channels=3840,
+        )
 
-    # Load weights on CPU first
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    print(f"  Loaded: {len(state_dict) - len(missing)} keys, "
+    # Load weights directly (model is on meta device, state dict is bf16)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False, assign=True)
+    print(f"  Loaded: {len(state_dict) - len(unexpected)} keys, "
           f"missing: {len(missing)}, unexpected: {len(unexpected)}")
     if missing:
         # Filter to show non-audio missing keys
@@ -92,7 +100,7 @@ def load_base_model(model_path: str, device: str = "cuda:1", quantize: bool = Tr
         if non_audio:
             print(f"  WARNING: {len(non_audio)} non-audio missing keys: {non_audio[:5]}...")
     del state_dict
-    model = model.to(dtype=torch.bfloat16)
+    gc.collect()
 
     if quantize:
         print("  Quantizing to int8-quanto (block-by-block)...")
@@ -216,11 +224,148 @@ def load_lora_weights(model, path):
     """Load LoRA weights into a PEFT-wrapped model."""
     lora_state = load_file(str(path))
     missing, unexpected = model.load_state_dict(lora_state, strict=False)
-    loaded = len(lora_state) - len(missing)
-    print(f"  Loaded LoRA weights: {path} ({loaded} tensors)")
-    if missing:
-        print(f"  WARNING: {len(missing)} missing LoRA keys")
+    # missing = model keys not in lora_state (base weights — expected)
+    # unexpected = lora_state keys not in model (should be 0)
+    loaded = len(lora_state) - len(unexpected)
+    print(f"  Loaded LoRA weights: {path} ({loaded}/{len(lora_state)} tensors)")
+    if unexpected:
+        print(f"  WARNING: {len(unexpected)} unexpected LoRA keys (not in model)")
     return model
+
+
+def load_vae_decoder(model_path, device="cuda:1"):
+    """Load the LTX-2 VAE decoder for pixel-space reconstructions."""
+    try:
+        # Try adding ltx-trainer source to path if not installed
+        trainer_src = Path("/home/johndpope/Documents/GitHub/ltx2-omnitransfer/ltx-trainer/src")
+        if trainer_src.exists() and str(trainer_src) not in sys.path:
+            sys.path.insert(0, str(trainer_src))
+
+        from ltx_trainer.model_loader import load_model as load_ltx_model
+        components = load_ltx_model(
+            checkpoint_path=model_path,
+            device="cpu",
+            dtype=torch.bfloat16,
+            with_video_vae_decoder=True,
+            with_video_vae_encoder=False,
+            with_text_encoder=False,
+        )
+        decoder = components.video_vae_decoder.to(dtype=torch.bfloat16)
+        print(f"  VAE decoder loaded (will decode on {device})")
+        return decoder
+    except Exception as e:
+        print(f"  WARNING: Could not load VAE decoder: {e}")
+        print(f"  (Latent-space visualizations will still work)")
+        return None
+
+
+def latent_to_images(latent, nf, h, w, channels=(0, 1, 2)):
+    """Convert latent [B, F*H*W, C] to wandb images for visualization.
+
+    Takes first frame, selected channels → normalized RGB-like image.
+    """
+    B, S, C = latent.shape
+    x = latent[0].detach().float().cpu()  # [seq, C]
+    x = x.view(nf, h, w, C)  # [F, H, W, C]
+    frame = x[0]  # [H, W, C] — first frame
+
+    # Select 3 channels and normalize to [0, 1]
+    img = frame[:, :, list(channels)]  # [H, W, 3]
+    lo, hi = img.min(), img.max()
+    if hi - lo > 1e-6:
+        img = (img - lo) / (hi - lo)
+    else:
+        img = img * 0 + 0.5
+    return img.numpy()
+
+
+def decode_latent_to_video(vae_decoder, latent_seq, nf, h, w, in_channels=128,
+                            device="cuda:1"):
+    """Decode latent [B, F*H*W, C] → pixel frames via VAE decoder.
+
+    Returns list of numpy images [H_pixel, W_pixel, 3] in [0, 255].
+    """
+    if vae_decoder is None:
+        return None
+
+    B, S, C = latent_seq.shape
+    # Reshape: [B, F*H*W, C] → [B, C, F, H, W]
+    x = latent_seq[0:1].detach().float()
+    x = x.view(1, nf, h, w, C).permute(0, 4, 1, 2, 3)  # [1, C, F, H, W]
+    x = x.to(device=device, dtype=torch.bfloat16)
+
+    vae_decoder.to(device=device, dtype=torch.bfloat16)
+    with torch.no_grad():
+        pixels = vae_decoder(x)  # [1, 3, F_out, H_out, W_out]
+    vae_decoder.to("cpu")
+    torch.cuda.empty_cache()
+
+    # Convert to numpy frames
+    pixels = pixels[0].float().cpu().clamp(-1, 1)  # [3, F, H, W]
+    pixels = (pixels + 1) / 2 * 255  # [0, 255]
+    frames = []
+    for f in range(pixels.shape[1]):
+        frame = pixels[:, f].permute(1, 2, 0).numpy().astype(np.uint8)  # [H, W, 3]
+        frames.append(frame)
+    return frames
+
+
+def log_reconstructions(step, teacher_out, student_outs, noisy, nf, h, w,
+                        vae_decoder=None, vae_device="cuda:1"):
+    """Log teacher vs student reconstructions to wandb.
+
+    Args:
+        student_outs: dict mapping scale → student output tensor
+    """
+    if not HAS_WANDB or wandb.run is None:
+        return
+
+    log_dict = {}
+
+    # --- Latent-space visualizations (cheap, every log step) ---
+    # Noisy input
+    noisy_img = latent_to_images(noisy, nf, h, w, channels=(0, 1, 2))
+    log_dict["latent/noisy_input"] = wandb.Image(noisy_img, caption="Noisy input (ch 0-2)")
+
+    # Teacher
+    teacher_img = latent_to_images(teacher_out, nf, h, w, channels=(0, 1, 2))
+    log_dict["latent/teacher"] = wandb.Image(teacher_img, caption="Teacher (scale=1)")
+
+    # Students per scale
+    for scale, student_out in student_outs.items():
+        student_img = latent_to_images(student_out, nf, h, w, channels=(0, 1, 2))
+        log_dict[f"latent/student_scale{scale}"] = wandb.Image(
+            student_img, caption=f"Student (scale={scale})")
+
+        # Difference map (error visualization)
+        diff = (teacher_out - student_out)[0].detach().float().cpu()
+        diff = diff.view(nf, h, w, -1)[0]  # first frame [H, W, C]
+        diff_mag = diff.norm(dim=-1)  # [H, W] magnitude
+        lo, hi = diff_mag.min(), diff_mag.max()
+        if hi - lo > 1e-6:
+            diff_mag = (diff_mag - lo) / (hi - lo)
+        log_dict[f"latent/error_scale{scale}"] = wandb.Image(
+            diff_mag.numpy(), caption=f"Error magnitude (scale={scale})")
+
+    # --- VAE pixel-space reconstructions (expensive, less frequent) ---
+    if vae_decoder is not None:
+        try:
+            teacher_frames = decode_latent_to_video(
+                vae_decoder, teacher_out, nf, h, w, device=vae_device)
+            if teacher_frames:
+                log_dict["pixel/teacher"] = wandb.Image(
+                    teacher_frames[0], caption="Teacher frame 0")
+
+            for scale, student_out in student_outs.items():
+                student_frames = decode_latent_to_video(
+                    vae_decoder, student_out, nf, h, w, device=vae_device)
+                if student_frames:
+                    log_dict[f"pixel/student_scale{scale}"] = wandb.Image(
+                        student_frames[0], caption=f"Student scale={scale} frame 0")
+        except Exception as e:
+            print(f"  WARNING: VAE decode failed: {e}")
+
+    wandb.log(log_dict, step=step)
 
 
 def create_ddit_adapter(inner_dim=4096, in_channels=128, scales=(2, 4), lora_rank=32,
@@ -253,40 +398,94 @@ def create_ddit_adapter(inner_dim=4096, in_channels=128, scales=(2, 4), lora_ran
 
 
 def load_training_data(data_root: str, max_samples: int = 128):
-    """Load pre-encoded latents and text embeddings for distillation training."""
+    """Load pre-encoded latents and text embeddings for distillation training.
+
+    Latents are loaded eagerly (small: ~1MB each).
+    Conditions are loaded lazily with deduplication — synthetic data cycles
+    conditions from N_cond originals, so we cache unique ones (~16MB each).
+    """
     latent_dir = Path(data_root) / "latents"
     cond_dir = Path(data_root) / "conditions_final"
     if not latent_dir.exists():
         raise FileNotFoundError(f"No latents directory at {latent_dir}")
 
+    # Phase 1: Load latents eagerly (they're small, ~4GB for 5000 samples)
     samples = []
-    for pt_file in sorted(latent_dir.glob("*.pt"))[:max_samples]:
-        data = torch.load(pt_file, weights_only=False, map_location="cpu")
-        latents = data["latents"]  # [C, F, H, W]
+    skipped = 0
+    latent_files = sorted(latent_dir.glob("*.pt"))[:max_samples]
+    print(f"Loading {len(latent_files)} latent files from {latent_dir}...")
+    for i, pt_file in enumerate(latent_files):
+        try:
+            data = torch.load(pt_file, weights_only=False, map_location="cpu")
+            latents = data["latents"]  # [C, F, H, W]
 
-        # Extract dims — handle both tensor and int formats
-        nf = data.get("num_frames", latents.shape[1])
-        h = data.get("height", latents.shape[2])
-        w = data.get("width", latents.shape[3])
-        nf = nf.item() if isinstance(nf, torch.Tensor) else int(nf)
-        h = h.item() if isinstance(h, torch.Tensor) else int(h)
-        w = w.item() if isinstance(w, torch.Tensor) else int(w)
+            # Extract dims — handle both tensor and int formats
+            nf = data.get("num_frames", latents.shape[1])
+            h = data.get("height", latents.shape[2])
+            w = data.get("width", latents.shape[3])
+            nf = nf.item() if isinstance(nf, torch.Tensor) else int(nf)
+            h = h.item() if isinstance(h, torch.Tensor) else int(h)
+            w = w.item() if isinstance(w, torch.Tensor) else int(w)
 
-        # Load matching text embedding
-        cond_file = cond_dir / pt_file.name
-        text_embeds = None
-        text_mask = None
-        if cond_file.exists():
-            cond = torch.load(cond_file, weights_only=False, map_location="cpu")
-            text_embeds = cond["video_prompt_embeds"]  # [1024, 3840]
-            text_mask = cond["prompt_attention_mask"]   # [1024]
+            samples.append({
+                "latents": latents, "num_frames": nf, "height": h, "width": w,
+                "text_embeds": None, "text_mask": None,
+                "cond_file": cond_dir / pt_file.name,
+            })
+        except Exception as e:
+            skipped += 1
+            if skipped <= 3:
+                print(f"  Skipped corrupt file: {pt_file.name}: {e}")
+        if (i + 1) % 1000 == 0:
+            print(f"  Loaded {i+1}/{len(latent_files)} latents...")
 
-        samples.append({
-            "latents": latents, "num_frames": nf, "height": h, "width": w,
-            "text_embeds": text_embeds, "text_mask": text_mask,
-        })
+    # Phase 2: Load conditions with deduplication cache
+    # Conditions cycle from N_cond originals — detect by file content hash or just
+    # cache by file size+name pattern. For simplicity, cache all unique conditions.
+    cond_cache = {}  # maps cond file path -> (text_embeds, text_mask)
+    cond_loaded = 0
+    cond_files = sorted(cond_dir.glob("*.pt")) if cond_dir.exists() else []
+    n_cond_files = len(cond_files)
 
-    print(f"Loaded {len(samples)} training samples from {latent_dir}")
+    # Detect cycle length: if conditions are cycled copies, loading only unique ones
+    # saves massive RAM (128 * 16MB = 2GB vs 5000 * 16MB = 74GB)
+    # Strategy: load first condition, then check if file at index N_cond matches
+    cycle_len = n_cond_files  # default: all unique
+    if n_cond_files > 128:
+        # Try common cycle lengths
+        for test_cycle in [128, 256, 512]:
+            if test_cycle < n_cond_files:
+                try:
+                    c0 = torch.load(cond_files[0], weights_only=False, map_location="cpu")
+                    cn = torch.load(cond_files[test_cycle], weights_only=False, map_location="cpu")
+                    if torch.equal(c0["video_prompt_embeds"], cn["video_prompt_embeds"]):
+                        cycle_len = test_cycle
+                        print(f"  Detected condition cycle length: {cycle_len}")
+                        break
+                except Exception:
+                    pass
+
+    # Load only unique conditions
+    print(f"Loading {min(cycle_len, n_cond_files)} unique conditions (of {n_cond_files} total)...")
+    for i in range(min(cycle_len, n_cond_files)):
+        try:
+            cond = torch.load(cond_files[i], weights_only=False, map_location="cpu")
+            cond_cache[i] = (cond["video_prompt_embeds"], cond["prompt_attention_mask"])
+            cond_loaded += 1
+        except Exception:
+            pass
+
+    # Assign conditions to samples (cycling through cache)
+    for i, s in enumerate(samples):
+        cache_idx = i % cycle_len if cycle_len <= n_cond_files else i
+        if cache_idx in cond_cache:
+            s["text_embeds"], s["text_mask"] = cond_cache[cache_idx]
+        # Remove cond_file reference (not needed anymore)
+        s.pop("cond_file", None)
+
+    print(f"Loaded {len(samples)} training samples from {latent_dir}"
+          + (f" (skipped {skipped} corrupt)" if skipped else "")
+          + f", {cond_loaded} unique conditions cached")
     if samples:
         s = samples[0]
         has_text = s["text_embeds"] is not None
@@ -557,7 +756,8 @@ def get_student_output(base_model, adapter, noisy_latent, positions,
     return output
 
 
-def train_phase2(base_model, adapter, samples, args, use_lora=False):
+def train_phase2(base_model, adapter, samples, args, use_lora=False,
+                  vae_decoder=None):
     """Distillation training through frozen base model.
 
     When use_lora=True, the base_model is a PeftModel with LoRA adapters.
@@ -570,6 +770,9 @@ def train_phase2(base_model, adapter, samples, args, use_lora=False):
     device = args.device
     dtype = torch.bfloat16
     scales = tuple(int(s) for s in args.scales.split(","))
+    log_interval = getattr(args, 'log_interval', 50)
+    vae_interval = getattr(args, 'vae_interval', 200)
+    vae_device = "cuda:1" if torch.cuda.device_count() > 1 else device
 
     # Collect all trainable parameters: adapter + LoRA
     trainable_params = list(adapter.parameters())
@@ -591,6 +794,30 @@ def train_phase2(base_model, adapter, samples, args, use_lora=False):
     print(f"  Scales: {scales}, LR: {args.lr}")
     vram = torch.cuda.memory_allocated(device) / 1e9
     print(f"  VRAM before training: {vram:.1f}GB")
+    print(f"  Logging: latent images every {log_interval} steps, "
+          f"VAE decode every {vae_interval} steps")
+
+    # Init wandb
+    if HAS_WANDB and not getattr(args, 'no_wandb', False):
+        wandb.init(
+            project="ddit-distillation",
+            name=f"p2_lora-{args.lora_target}_r{args.lora_rank}_lr{args.lr}",
+            config={
+                "phase": 2,
+                "scales": list(scales),
+                "lr": args.lr,
+                "steps": args.steps,
+                "use_lora": use_lora,
+                "lora_target": getattr(args, 'lora_target', 'both'),
+                "lora_rank": args.lora_rank,
+                "adapter_params": sum(p.numel() for p in adapter.parameters()),
+                "lora_params": sum(p.numel() for p in trainable_params) - sum(p.numel() for p in adapter.parameters()),
+                "total_trainable": sum(p.numel() for p in trainable_params),
+                "data_samples": len(samples),
+                "device": str(device),
+            },
+        )
+        print(f"  wandb: {wandb.run.url}")
 
     losses = []
     step = 0
@@ -619,9 +846,14 @@ def train_phase2(base_model, adapter, samples, args, use_lora=False):
             # Accumulate gradients across all scales, then do one optimizer step.
             # This is critical when using LoRA: shared LoRA params would get
             # conflicting updates if we stepped per-scale.
-            step_losses = []
+            step_losses = {}
             valid_scales = [s for s in scales if h % s == 0 and w % s == 0]
             optimizer.zero_grad()
+
+            # Should we log reconstructions this step?
+            should_log_latent = (step + 1) % log_interval == 0
+            should_log_vae = vae_decoder is not None and (step + 1) % vae_interval == 0
+            student_outs_for_vis = {}  # Capture for visualization
 
             for scale in valid_scales:
                 # Student: coarse-res forward (gradients through adapter + LoRA)
@@ -635,7 +867,11 @@ def train_phase2(base_model, adapter, samples, args, use_lora=False):
 
                 # Backward accumulates gradients; frees activations per-scale
                 loss.backward()
-                step_losses.append(loss.item() * len(valid_scales))  # Log unnormalized
+                step_losses[scale] = loss.item() * len(valid_scales)  # unnormalized
+
+                # Keep detached copy for visualization before deleting
+                if should_log_latent or should_log_vae:
+                    student_outs_for_vis[scale] = student_out.detach()
 
                 del student_out, loss
                 torch.cuda.empty_cache()
@@ -644,7 +880,32 @@ def train_phase2(base_model, adapter, samples, args, use_lora=False):
                 torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                 optimizer.step()
                 scheduler.step()
-                losses.append(sum(step_losses) / len(step_losses))
+                avg_loss = sum(step_losses.values()) / len(step_losses)
+                losses.append(avg_loss)
+
+                # wandb scalar logging
+                if HAS_WANDB and wandb.run is not None:
+                    log_scalars = {
+                        "train/loss": avg_loss,
+                        "train/lr": scheduler.get_last_lr()[0],
+                        "train/sigma": sigma,
+                    }
+                    for s, l in step_losses.items():
+                        log_scalars[f"train/loss_scale{s}"] = l
+                    vram_now = torch.cuda.max_memory_allocated(device) / 1e9
+                    log_scalars["train/peak_vram_gb"] = vram_now
+                    wandb.log(log_scalars, step=step + 1)
+
+            # Log reconstruction images
+            if (should_log_latent or should_log_vae) and student_outs_for_vis:
+                use_vae = vae_decoder if should_log_vae else None
+                log_reconstructions(
+                    step + 1, teacher_out, student_outs_for_vis, noisy,
+                    nf, h, w, vae_decoder=use_vae, vae_device=vae_device,
+                )
+                del student_outs_for_vis
+            else:
+                student_outs_for_vis.clear()
 
             # Free activation memory
             del teacher_out, noisy
@@ -678,6 +939,10 @@ def train_phase2(base_model, adapter, samples, args, use_lora=False):
         save_lora_weights(base_model, lora_path)
     if losses:
         print(f"  Final loss: {losses[-1]:.6f}")
+
+    if HAS_WANDB and wandb.run is not None:
+        wandb.finish()
+
     return adapter
 
 
@@ -729,7 +994,13 @@ def train(args):
         if use_lora and args.resume_lora:
             load_lora_weights(base_model, args.resume_lora)
 
-        adapter = train_phase2(base_model, adapter, samples, args, use_lora=use_lora)
+        # Load VAE decoder for pixel-space reconstructions
+        vae_decoder = None
+        if not getattr(args, 'no_wandb', False) and not getattr(args, 'no_vae', False):
+            vae_decoder = load_vae_decoder(args.model_path)
+
+        adapter = train_phase2(base_model, adapter, samples, args,
+                                use_lora=use_lora, vae_decoder=vae_decoder)
 
     elif args.phase == 0:
         # Phase 0: both phases sequentially
@@ -804,6 +1075,12 @@ def main():
     parser.add_argument("--lora_target", type=str, default="both",
                         choices=["ff", "attn", "both"],
                         help="LoRA target: ff (paper), attn, or both (default: both)")
+    parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
+    parser.add_argument("--no_vae", action="store_true", help="Disable VAE decode for reconstructions")
+    parser.add_argument("--log_interval", type=int, default=50,
+                        help="Log latent reconstruction images every N steps")
+    parser.add_argument("--vae_interval", type=int, default=200,
+                        help="Log VAE pixel reconstructions every N steps")
     args = parser.parse_args()
 
     # Handle --no_lora flag

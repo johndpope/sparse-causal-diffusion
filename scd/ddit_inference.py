@@ -315,12 +315,21 @@ class DDiTInferenceWrapper:
             context_mask=video_modality.context_mask,
         )
 
-        # 6. Merge encoder features too (they'll be token-concatenated)
+        # 6. Spatially pool encoder features to match merged decoder resolution
+        # Encoder features are [B, seq_len, D] in inner_dim (4096) space.
+        # We avg_pool in the spatial dims to get [B, new_seq_len, D].
         if encoder_features is not None:
-            merged_enc_features = merge_layer.merge(
-                encoder_features, num_frames, height, width
-            )
-            merged_enc_features = merge_layer.patchify_proj(merged_enc_features)
+            B_enc = encoder_features.shape[0]
+            D = encoder_features.shape[-1]
+            new_h, new_w = height // scale, width // scale
+            # Reshape to [B, F, H, W, D] → pool H,W → [B, F, h, w, D]
+            ef = encoder_features.view(B_enc, num_frames, height, width, D)
+            ef = ef.permute(0, 1, 4, 2, 3)  # [B, F, D, H, W]
+            ef = ef.reshape(B_enc * num_frames, D, height, width)
+            ef = torch.nn.functional.adaptive_avg_pool2d(ef, (new_h, new_w))
+            ef = ef.reshape(B_enc, num_frames, D, new_h, new_w)
+            ef = ef.permute(0, 1, 3, 4, 2)  # [B, F, h, w, D]
+            merged_enc_features = ef.reshape(B_enc, new_seq_len, D)
         else:
             merged_enc_features = None
 
@@ -348,16 +357,9 @@ class DDiTInferenceWrapper:
         # 9. Swap in our DDiT-projected tokens (bypass base patchify_proj)
         video_args = replace(video_args, x=merged_projected)
 
-        # 10. Adjust causal mask for new sequence length
-        new_tpf = (height // scale) * (width // scale)
-        from ltx_core.model.transformer.scd_model import build_frame_causal_mask
-        merged_mask = build_frame_causal_mask(
-            seq_len=new_seq_len,
-            tokens_per_frame=new_tpf,
-            device=merged_projected.device,
-            dtype=merged_projected.dtype,
-        )
-        video_args = replace(video_args, self_attn_mask=merged_mask)
+        # 10. Decoder uses NO causal mask (only encoder does)
+        # self_attn_mask stays None from preprocessor — bidirectional attention
+        video_args = replace(video_args, self_attn_mask=None)
 
         # 11. Combine encoder features with decoder tokens (token_concat)
         if merged_enc_features is not None:
